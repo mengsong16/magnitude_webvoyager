@@ -69,11 +69,27 @@ async function main() {
         agent = await startBrowserAgent({
             browser: { context: context },
             llm: {
-                provider: "claude-code",
+                // provider: 'openai-generic',
+                // options: {
+                //     baseUrl: 'https://openrouter.ai/api/v1',
+                //     // model: 'bytedance/ui-tars-1.5-7b',
+                //     model: 'z-ai/glm-4.5v',
+                //     // model: 'meta-llama/llama-4-maverick',
+                //     apiKey: process.env.OPENROUTER_API_KEY,
+                //     // temperature: 0.1
+                // },
+                // options: {
+                //     baseUrl: 'https://openrouter.ai/api/v1',
+                //     // model: 'qwen/qwen2.5-vl-72b-instruct',
+                //     model: 'qwen/qwen3-vl-30b-a3b-instruct',
+                //     apiKey: process.env.OPENROUTER_API_KEY
+                // }
+                provider: 'anthropic', // your provider of choice
                 options: {
-                    model: "claude-sonnet-4-20250514",
-                    temperature: 0.5
-                },
+                    // any required + optional configuration for that provider
+                    model: 'claude-sonnet-4-5-20250929',
+                    apiKey: process.env.ANTHROPIC_API_KEY
+                }
             },
             url: task.web,
             actions: [
@@ -88,8 +104,8 @@ async function main() {
                 }),
             ],
             narrate: true,
-            prompt: `Be careful to satisfy the task criteria precisely. If sequences of actions are failing, go one action at at time.\nConsider that today is ${formattedDate}.`,
-            screenshotMemoryLimit: 3,
+            prompt: `Be careful to satisfy the task criteria precisely. If sequences of actions are failing, go one action at at time.\nConsider that today is ${formattedDate}.\n\nFor scrolling: positive deltaY values scroll DOWN (to see content below), negative deltaY values scroll UP (to see content above).`,
+            // screenshotMemoryLimit: 3,
         });
 
         agent.events.on("tokensUsed", async (usage: ModelUsage) => {

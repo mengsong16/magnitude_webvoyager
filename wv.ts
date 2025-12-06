@@ -292,10 +292,25 @@ async function evalTask(taskId: string, resultsPath: string = "results/default")
 
     const agent = new Agent({
         llm: {
-            provider: "claude-code",
+            // provider: 'openai-generic',
+            // options: {
+            //     baseUrl: 'https://openrouter.ai/api/v1',
+            //     model: 'bytedance/ui-tars-1.5-7b',
+            //     apiKey: process.env.OPENROUTER_API_KEY,
+            // },
+            // options: {
+            //     baseUrl: 'https://openrouter.ai/api/v1',
+            //     // model: 'qwen/qwen2.5-vl-72b-instruct',
+            //     model: 'qwen/qwen3-vl-30b-a3b-instruct',
+            //     apiKey: process.env.OPENROUTER_API_KEY
+            // }
+
+            provider: 'anthropic', // your provider of choice
             options: {
-                model: "claude-sonnet-4-20250514",
-            },
+                // any required + optional configuration for that provider
+                model: 'claude-sonnet-4-5-20250929',
+                apiKey: process.env.ANTHROPIC_API_KEY
+            }
         },
     });
     await agent.start();

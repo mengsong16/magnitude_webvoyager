@@ -7,7 +7,12 @@
     "upload": "bun run upload-to-blob.ts"
   },
   "dependencies": {
-    "@vercel/blob": "^1.1.1"
+    "@clack/prompts": "^0.11.0",
+    "@vercel/blob": "^1.1.1",
+    "commander": "^14.0.1",
+    "magnitude-core": "^0.3.0",
+    "patchright": "^1.56.1",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
