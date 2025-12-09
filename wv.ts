@@ -8,7 +8,24 @@ import * as p from "@clack/prompts";
 import { Agent } from "magnitude-core";
 import { spawn } from "node:child_process";
 
-const TASKS_PATH = path.join(__dirname, "data", "patchedTasks.jsonl");
+const DEFAULT_DATASET_FILE = "patchedTasks.jsonl";
+const DEFAULT_RESULTS_DIR = "default";
+
+// Keep TASKS_PATH mutable for minimal changes across helpers
+let TASKS_PATH = path.join(__dirname, "data", DEFAULT_DATASET_FILE);
+
+function resolveTasksPath(datasetFile?: string) {
+    const file = datasetFile || DEFAULT_DATASET_FILE;
+    return path.join(__dirname, "data", file);
+}
+
+// results_dir = subfolder name under ./results
+// resultsPathOpt = backward-compatible override from -r/--results-path
+function resolveResultsPath(resultsDir?: string, resultsPathOpt?: string) {
+    if (resultsPathOpt) return resultsPathOpt;
+    const dir = resultsDir || DEFAULT_RESULTS_DIR;
+    return path.join("results", dir);
+}
 
 // src: https://github.com/MinorJerry/WebVoyager/blob/main/evaluation/auto_eval.py
 const EVALUATION_PROMPT = `
@@ -43,13 +60,17 @@ interface RunOptions {
     failed?: boolean;
     failedOnly?: boolean;
     replace?: boolean;
-    resultsPath?: string;
+    resultsPath?: string;   // legacy override
+    dataset_file?: string;
+    results_dir?: string;
 }
 
 interface EvalOptions {
     workers: string;
     replace?: boolean;
-    resultsPath?: string;
+    resultsPath?: string;   // legacy override
+    dataset_file?: string;
+    results_dir?: string;
 }
 
 // Helper functions
@@ -113,18 +134,20 @@ async function getCategories(): Promise<Map<string, number>> {
 
 function isTaskId(input: string): boolean {
     // Task IDs have format "Category--number"
+    // Online-Mind2Web ids might not include "--", but we keep this logic
+    // to preserve existing UX behavior.
     return input.includes("--");
 }
 
 async function selectCategories(): Promise<string[] | null> {
     const categories = await getCategories();
-    
+
     // Calculate total tasks
     let totalTasks = 0;
     for (const [_, count] of categories) {
         totalTasks += count;
     }
-    
+
     // First ask: all or specific
     const mode = await p.select({
         message: "Which categories would you like to run?",
@@ -211,7 +234,7 @@ async function getTaskStatus(taskId: string, resultsPath: string = "results/defa
 }> {
     const resultPath = path.join(resultsPath, `${taskId}.json`);
     const evalPath = path.join(resultsPath, `${taskId}.eval.json`);
-    
+
     const hasRun = fs.existsSync(resultPath);
     const hasEval = fs.existsSync(evalPath);
     let isSuccess = false;
@@ -230,7 +253,7 @@ async function getTaskStatus(taskId: string, resultsPath: string = "results/defa
 
 async function filterTasksByOptions(tasks: Task[], options: RunOptions): Promise<Task[]> {
     const filteredTasks: Task[] = [];
-    const resultsPath = options.resultsPath || "results/default";
+    const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath);
 
     for (const task of tasks) {
         const status = await getTaskStatus(task.id, resultsPath);
@@ -253,27 +276,27 @@ async function filterTasksByOptions(tasks: Task[], options: RunOptions): Promise
             const resultPath = path.join(resultsPath, `${task.id}.json`);
             let hasAnswer = false;
             let hasTimedOut = false;
-            
+
             if (fs.existsSync(resultPath)) {
                 try {
                     const resultData = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
-                    
+
                     // Check if task timed out
                     if (resultData.timedOut === true) {
                         hasTimedOut = true;
                     }
-                    
+
                     // Check if memory.observations contains an answer
                     if (resultData.memory && resultData.memory.observations) {
-                        hasAnswer = resultData.memory.observations.some((obs: any) => 
-                            obs.source === "action:taken:answer"
+                        hasAnswer = resultData.memory.observations.some((obs: any) =>
+                            obs.source === "action:taken:answer",
                         );
                     }
                 } catch {
                     // Error reading file, treat as no answer
                 }
             }
-            
+
             // Only run if: file doesn't exist, OR (has no answer AND didn't timeout)
             if (!fs.existsSync(resultPath) || (!hasAnswer && !hasTimedOut)) {
                 filteredTasks.push(task);
@@ -309,8 +332,8 @@ async function evalTask(taskId: string, resultsPath: string = "results/default")
             options: {
                 // any required + optional configuration for that provider
                 model: 'claude-sonnet-4-5-20250929',
-                apiKey: process.env.ANTHROPIC_API_KEY
-            }
+                apiKey: process.env.ANTHROPIC_API_KEY,
+            },
         },
     });
     await agent.start();
@@ -335,10 +358,10 @@ async function runTaskAsProcess(task: Task, runEval: boolean, resultsPath: strin
             path.join(__dirname, 'wv-runner.ts'),
             JSON.stringify(task),
             String(runEval),
-            resultsPath
+            resultsPath,
         ], {
             stdio: 'inherit',
-            env: process.env
+            env: process.env,
         });
 
         const timeout = setTimeout(() => {
@@ -366,7 +389,6 @@ async function runTaskAsProcess(task: Task, runEval: boolean, resultsPath: strin
     });
 }
 
-
 async function runTasksParallel(tasks: Task[], workers: number, runEval: boolean = false, resultsPath: string = "results/default") {
     // Run tasks in parallel with worker processes
     let taskIndex = 0;
@@ -382,7 +404,7 @@ async function runTasksParallel(tasks: Task[], workers: number, runEval: boolean
             );
 
             const success = await runTaskAsProcess(task, runEval, resultsPath);
-            
+
             if (success) {
                 completedTasks++;
                 console.log(
@@ -457,8 +479,14 @@ program
     .option("--failed", "Include failed tasks (default: only incomplete tasks) - useful for pass@N")
     .option("--failed-only", "Only run failed tasks")
     .option("--replace", "Run all tasks regardless of status")
-    .option("-r, --results-path <path>", "Path to results directory", "results/default")
+    .option("-r, --results-path <path>", "Path to results directory")
+    .option("--dataset_file <name>", "Dataset file under ./data", DEFAULT_DATASET_FILE)
+    .option("--results_dir <name>", "Subfolder under ./results", DEFAULT_RESULTS_DIR)
     .action(async (input: string | undefined, options: RunOptions) => {
+        // Resolve paths from new params (and keep -r as override)
+        TASKS_PATH = resolveTasksPath(options.dataset_file);
+        const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath);
+
         const workers = parseInt(options.workers);
         let tasksToRun: Task[] = [];
 
@@ -477,11 +505,11 @@ program
                 console.error(`No tasks found for category: ${input}`);
                 return;
             }
-            
+
             // Ask for task selection
             const selectedTasks = await selectTasksFromCategory(input);
             if (!selectedTasks) return;
-            
+
             tasksToRun = await filterTasksByOptions(selectedTasks, options);
         } else {
             // No input - ask for categories
@@ -492,7 +520,7 @@ program
                 // Single category - ask for task selection
                 const selectedTasks = await selectTasksFromCategory(selectedCategories[0]!);
                 if (!selectedTasks) return;
-                
+
                 tasksToRun = await filterTasksByOptions(selectedTasks, options);
             } else {
                 // Multiple categories - run all tasks in each
@@ -510,14 +538,13 @@ program
         }
 
         // Ensure results directory exists
-        const resultsPath = options.resultsPath || "results/default";
         if (!fs.existsSync(resultsPath)) {
             fs.mkdirSync(resultsPath, { recursive: true });
         }
-        
+
         p.outro(`Running ${tasksToRun.length} task${tasksToRun.length !== 1 ? "s" : ""} with ${workers} worker${workers !== 1 ? "s" : ""}`);
-        
-        await runTasksParallel(tasksToRun, workers, options.eval || false, options.resultsPath || "results/default");
+
+        await runTasksParallel(tasksToRun, workers, options.eval || false, resultsPath);
     });
 
 program
@@ -525,8 +552,14 @@ program
     .description("Evaluate tasks by category or task ID")
     .option("-w, --workers <number>", "Number of parallel workers", "1")
     .option("--replace", "Re-run evaluations even if they already exist")
-    .option("-r, --results-path <path>", "Path to results directory", "results/default")
+    .option("-r, --results-path <path>", "Path to results directory")
+    .option("--dataset_file <name>", "Dataset file under ./data", DEFAULT_DATASET_FILE)
+    .option("--results_dir <name>", "Subfolder under ./results", DEFAULT_RESULTS_DIR)
     .action(async (input: string | undefined, options: EvalOptions) => {
+        // Resolve paths from new params (and keep -r as override)
+        TASKS_PATH = resolveTasksPath(options.dataset_file);
+        const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath);
+
         const workers = parseInt(options.workers);
         let taskIdsToEval: string[] = [];
 
@@ -540,10 +573,10 @@ program
                 console.error(`No tasks found for category: ${input}`);
                 return;
             }
-            
+
             // Filter to tasks that have been run
             for (const task of categoryTasks) {
-                const status = await getTaskStatus(task.id, options.resultsPath || "results/default");
+                const status = await getTaskStatus(task.id, resultsPath);
                 if (status.hasRun && (options.replace || !status.hasEval)) {
                     taskIdsToEval.push(task.id);
                 }
@@ -556,7 +589,7 @@ program
             for (const category of selectedCategories) {
                 const categoryTasks = await getAllTasks(TASKS_PATH, category);
                 for (const task of categoryTasks) {
-                    const status = await getTaskStatus(task.id, options.resultsPath || "results/default");
+                    const status = await getTaskStatus(task.id, resultsPath);
                     if (status.hasRun && (options.replace || !status.hasEval)) {
                         taskIdsToEval.push(task.id);
                     }
@@ -570,23 +603,26 @@ program
         }
 
         // Ensure results directory exists
-        const resultsPath = options.resultsPath || "results/default";
         if (!fs.existsSync(resultsPath)) {
             fs.mkdirSync(resultsPath, { recursive: true });
         }
-        
+
         p.outro(`Evaluating ${taskIdsToEval.length} task${taskIdsToEval.length !== 1 ? "s" : ""} with ${workers} worker${workers !== 1 ? "s" : ""}`);
-        
-        await evalTasksParallel(taskIdsToEval, workers, options.resultsPath || "results/default");
+
+        await evalTasksParallel(taskIdsToEval, workers, resultsPath);
     });
 
 program
     .command("stats")
     .description("Show evaluation statistics")
     .option("-v, --verbose", "Show detailed stats for each task")
-    .option("-r, --results-path <path>", "Path to results directory", "results/default")
-    .action(async (options: { verbose?: boolean; resultsPath?: string }) => {
-        await showStats(options.verbose || false, options.resultsPath || "results/default");
+    .option("-r, --results-path <path>", "Path to results directory")
+    .option("--dataset_file <name>", "Dataset file under ./data", DEFAULT_DATASET_FILE)
+    .option("--results_dir <name>", "Subfolder under ./results", DEFAULT_RESULTS_DIR)
+    .action(async (options: any) => {
+        TASKS_PATH = resolveTasksPath(options.dataset_file);
+        const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath);
+        await showStats(options.verbose || false, resultsPath);
     });
 
 async function showStats(verbose: boolean = false, resultsPath: string = "results/default") {
@@ -625,7 +661,9 @@ async function showStats(verbose: boolean = false, resultsPath: string = "result
             const evalData = JSON.parse(fs.readFileSync(evalPath, "utf-8"));
             const isSuccess = evalData.result === "SUCCESS";
 
-            const category = taskId.split("--")[0]!;
+            // WebVoyager task ids look like "Category--num"
+            // Online-Mind2Web ids may be hash-like without "--"
+            const category = taskId.includes("--") ? taskId.split("--")[0]! : "online_mind2web";
 
             if (!categoryStats.has(category)) {
                 categoryStats.set(category, {
@@ -680,7 +718,7 @@ async function showStats(verbose: boolean = false, resultsPath: string = "result
 
         console.log(
             `${category.padEnd(16)} | ${stats.success}/${stats.total} (${successRate.toFixed(1)}%)`.padEnd(37) +
-            ` | ${avgActions.toFixed(1).padStart(10)}`
+            ` | ${avgActions.toFixed(1).padStart(10)}`,
         );
 
         if (verbose && stats.tasks) {
@@ -690,7 +728,7 @@ async function showStats(verbose: boolean = false, resultsPath: string = "result
                 const timeMin = (task.time / 1000 / 60).toFixed(1);
                 const status = task.success ? "✓" : "✗";
                 console.log(
-                    `  ${status} ${task.taskId.padEnd(20)} | Actions: ${task.actions.toString().padStart(3)} | Time: ${timeMin.padStart(5)} min`
+                    `  ${status} ${task.taskId.padEnd(20)} | Actions: ${task.actions.toString().padStart(3)} | Time: ${timeMin.padStart(5)} min`,
                 );
             }
             console.log();
@@ -707,7 +745,7 @@ async function showStats(verbose: boolean = false, resultsPath: string = "result
 
     console.log(
         `${"TOTAL".padEnd(16)} | ${totalSuccess}/${totalTasks} (${overallSuccessRate.toFixed(1)}%)`.padEnd(37) +
-        ` | ${overallAvgActions.toFixed(1).padStart(10)}`
+        ` | ${overallAvgActions.toFixed(1).padStart(10)}`,
     );
 
     console.log(`\nTotal evaluated tasks: ${totalTasks}`);
