@@ -311,7 +311,15 @@ async function evalTask(taskId: string, resultsPath: string = "results/default")
     const task = (await findTaskById(TASKS_PATH, taskId))!;
 
     const memoryPath = path.join(resultsPath, `${task.id}.json`);
-    const memJson = JSON.parse(fs.readFileSync(memoryPath, "utf-8")).memory;
+    //const memJson = JSON.parse(fs.readFileSync(memoryPath, "utf-8")).memory;
+    const raw = JSON.parse(fs.readFileSync(memoryPath, "utf-8"));
+    const memJson = raw?.memory;
+
+    if (!memJson || !Array.isArray(memJson.observations)) {
+        console.warn(`[Eval] Skip task ${task.id}: invalid memory shape`);
+        return;
+    }
+
 
     const agent = new Agent({
         llm: {
@@ -365,10 +373,19 @@ async function runTaskAsProcess(task: Task, runEval: boolean, resultsPath: strin
         });
 
         const timeout = setTimeout(() => {
-            console.error(`Process timeout for task ${task.id}, killing process`);
-            child.kill('SIGKILL');
+            console.error(`Process timeout for task ${task.id}, sending SIGTERM`);
+            child.kill('SIGTERM');
+
+            // ✅ give runner a short grace period to flush memory
+            setTimeout(() => {
+                try {
+                console.error(`Force killing task ${task.id} with SIGKILL`);
+                child.kill('SIGKILL');
+                } catch {}
+            }, 8000);
+
             resolve(false);
-        }, 25 * 60 * 1000); // 25 minutes total timeout
+        }, 25 * 60 * 1000);// 25 minutes total timeout
 
         child.on('exit', (code) => {
             clearTimeout(timeout);
@@ -426,7 +443,7 @@ async function runTasksParallel(tasks: Task[], workers: number, runEval: boolean
 
     await Promise.all(workerPromises);
 
-    console.log(`\nCompleted ${tasks.length} task${tasks.length !== 1 ? "s" : ""}`);
+    console.log(`\nAttempted ${tasks.length} task${tasks.length !== 1 ? "s" : ""}`);
 }
 
 async function evalTasksParallel(taskIds: string[], workers: number, resultsPath: string = "results/default") {

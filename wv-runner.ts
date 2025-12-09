@@ -33,30 +33,84 @@ async function main() {
         fs.mkdirSync(resultsPath, { recursive: true });
     }
     
+    // ✅ A2: signal-safe saver
+    let context: any = null;
+    let agent: any = null;
+    let startTime = Date.now();
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let actionCount = 0;
+
+    const saveSnapshot = async (extra?: Record<string, any>) => {
+        let memory: any = null;
+        try {
+            memory = agent ? await agent.memory.toJSON() : null;
+        } catch {}
+
+        const safeMemory = (memory && Array.isArray(memory.observations))
+            ? memory
+            : { observations: [] };
+
+        try {
+            fs.writeFileSync(
+            path.join(resultsPath, `${task.id}.json`),
+            JSON.stringify(
+                {
+                time: Date.now() - startTime,
+                actionCount,
+                totalInputTokens,
+                totalOutputTokens,
+                memory: safeMemory,
+                ...extra,
+                },
+                null,
+                4,
+            ),
+            );
+        } catch (e) {
+            console.error("[Runner] Failed to save snapshot:", e);
+        }
+    };
+
+    process.on("SIGTERM", async () => {
+    console.error(`[Runner] SIGTERM received for ${task.id}`);
+    await saveSnapshot({ error: "SIGTERM", timedOut: true });
+    process.exit(1);
+    });
+
+    process.on("SIGINT", async () => {
+    console.error(`[Runner] SIGINT received for ${task.id}`);
+    await saveSnapshot({ error: "SIGINT" });
+    process.exit(1);
+    });
+
     // Remove old evaluation file if it exists
     const evalPath = path.join(resultsPath, `${task.id}.eval.json`);
     if (fs.existsSync(evalPath)) {
         fs.unlinkSync(evalPath);
         console.log(`[Runner] Removed old evaluation file: ${evalPath}`);
     }
-    
+
+
     while (crashAttempts < MAX_CRASH_RETRIES) {
         console.log(`[Runner] Running task: ${task.id} - ${task.ques}`);
         console.log(`[Runner] URL: ${task.web}`);
 
-        let startTime = Date.now();
-        let context: any = null;
-        let agent: any = null;
-        let totalInputTokens = 0;
-        let totalOutputTokens = 0;
-        let actionCount = 0;
+        startTime = Date.now();
+        context = null;
+        agent = null;
+        totalInputTokens = 0;
+        totalOutputTokens = 0;
+        actionCount = 0;
 
         try {
-        const date = new Date();
-        const formattedDate = date.toLocaleDateString('en-US', {
-            month: 'long',
-            day: 'numeric',
-            year: 'numeric'
+            // ✅ stub: write empty memory snapshot before any browser/agent init
+            await saveSnapshot();
+            const date = new Date();
+            const formattedDate = date.toLocaleDateString('en-US', {
+                month: 'long',
+                day: 'numeric',
+                year: 'numeric'
         });
 
         context = await chromium.launchPersistentContext("", {
@@ -114,7 +168,15 @@ async function main() {
         });
 
         agent.events.on("actionDone", async () => {
-            const memory = await agent.memory.toJSON();
+            let memory: any = null;
+            try {
+                memory = await agent.memory.toJSON();
+            } catch {}
+
+            const safeMemory = (memory && Array.isArray(memory.observations))
+                ? memory
+                : { observations: [] };
+
             actionCount += 1;
 
             fs.writeFileSync(
@@ -125,7 +187,7 @@ async function main() {
                         actionCount,
                         totalInputTokens,
                         totalOutputTokens,
-                        memory,
+                        memory: safeMemory,
                     },
                     null,
                     4,
@@ -147,7 +209,16 @@ async function main() {
             console.log(`[Runner] Finished task: ${task.id}`);
             
             // Explicitly save final state before exit - ensure answer gets written out
-            const finalMemory = await agent.memory.toJSON();
+            let finalMemory: any = null;
+            try {
+                finalMemory = await agent.memory.toJSON();
+            } catch {}
+
+            const safeFinalMemory =
+            finalMemory && Array.isArray(finalMemory.observations)
+                ? finalMemory
+                : { observations: [] };
+
             fs.writeFileSync(
                 path.join(resultsPath, `${task.id}.json`),
                 JSON.stringify(
@@ -156,7 +227,7 @@ async function main() {
                         actionCount,
                         totalInputTokens,
                         totalOutputTokens,
-                        memory: finalMemory,
+                        memory: safeFinalMemory,
                     },
                     null,
                     4,
@@ -187,7 +258,17 @@ async function main() {
             }
             
             // Save error state before failing
-            const memory = agent ? await agent.memory.toJSON() : null;
+            let memory: any;
+            try {
+                memory = agent ? await agent.memory.toJSON() : null;
+            } catch {
+                memory = null;
+            }
+            // ✅ 强制保证最小可用形状
+            const safeMemory = (memory && Array.isArray(memory.observations))
+                ? memory
+                : { observations: [] };
+
             fs.writeFileSync(
                 path.join(resultsPath, `${task.id}.json`),
                 JSON.stringify(
@@ -196,7 +277,7 @@ async function main() {
                         actionCount,
                         totalInputTokens,
                         totalOutputTokens,
-                        memory,
+                        memory: safeMemory,
                         error: errorMessage,
                         timedOut: errorMessage.includes('timed out'),
                         crashAttempts: crashAttempts + 1
