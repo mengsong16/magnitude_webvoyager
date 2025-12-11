@@ -52,6 +52,9 @@ interface Task {
     id: string;
     ques: string;
     web: string;
+
+    // Online-Mind2Web / patchedTasks 里若有该字段就能读到
+    level?: "easy" | "medium" | "hard" | string;
 }
 
 interface RunOptions {
@@ -130,6 +133,28 @@ async function getCategories(): Promise<Map<string, number>> {
     }
 
     return categories;
+}
+
+async function getTaskLevelMap(filePath: string): Promise<Map<string, string>> {
+    const levelMap = new Map<string, string>();
+    const fileStream = fs.createReadStream(filePath);
+    const rl = readline.createInterface({
+        input: fileStream,
+        crlfDelay: Infinity,
+    });
+
+    for await (const line of rl) {
+        try {
+            const task = JSON.parse(line) as any;
+            const id = task.id;
+            const level = task.level ?? task.difficulty ?? "unknown";
+            if (id) levelMap.set(id, String(level));
+        } catch (error) {
+            console.error("Error parsing JSON line for level map:", error);
+        }
+    }
+
+    return levelMap;
 }
 
 function isTaskId(input: string): boolean {
@@ -251,6 +276,41 @@ async function getTaskStatus(taskId: string, resultsPath: string = "results/defa
     return { hasRun, hasEval, isSuccess };
 }
 
+type RunData = any;
+
+function extractRunSignals(runData: RunData) {
+  const actionCount = Number(runData?.actionCount ?? 0);
+  const hasZeroActions = actionCount === 0;
+
+  const hasTimedOut = runData?.timedOut === true;
+
+  let hasAnswer = false;
+  if (runData?.memory && Array.isArray(runData.memory.observations)) {
+    hasAnswer = runData.memory.observations.some(
+      (obs: any) => obs.source === "action:taken:answer",
+    );
+  }
+
+  const errMsg = String(runData?.error ?? runData?.err ?? "");
+  const isInitGotoTimeout =
+    hasZeroActions && errMsg.includes("goto: Timeout 30000ms exceeded");
+
+  return { actionCount, hasZeroActions, hasTimedOut, hasAnswer, isInitGotoTimeout };
+}
+
+/**
+ * Default rerun / unfinished criteria:
+ *  - no run file
+ *  - zero actions
+ *  - no answer and not timed out
+ */
+function isUnfinishedDefault(runExists: boolean, runData: RunData) {
+  if (!runExists) return true;
+
+  const { hasZeroActions, hasTimedOut, hasAnswer } = extractRunSignals(runData);
+  return hasZeroActions || (!hasAnswer && !hasTimedOut);
+}
+
 async function filterTasksByOptions(tasks: Task[], options: RunOptions): Promise<Task[]> {
     const filteredTasks: Task[] = [];
     const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath);
@@ -272,33 +332,21 @@ async function filterTasksByOptions(tasks: Task[], options: RunOptions): Promise
                 filteredTasks.push(task);
             }
         } else {
-            // Default: only run tasks that haven't been run OR haven't provided an answer (excludes timed out tasks)
             const resultPath = path.join(resultsPath, `${task.id}.json`);
-            let hasAnswer = false;
-            let hasTimedOut = false;
+            const runExists = fs.existsSync(resultPath);
+            let runData: any = null;
 
-            if (fs.existsSync(resultPath)) {
+            if (runExists) {
                 try {
-                    const resultData = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
-
-                    // Check if task timed out
-                    if (resultData.timedOut === true) {
-                        hasTimedOut = true;
-                    }
-
-                    // Check if memory.observations contains an answer
-                    if (resultData.memory && resultData.memory.observations) {
-                        hasAnswer = resultData.memory.observations.some((obs: any) =>
-                            obs.source === "action:taken:answer",
-                        );
-                    }
+                runData = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
                 } catch {
-                    // Error reading file, treat as no answer
+                // 读失败就当作 runData 无效
+                runData = null;
                 }
             }
 
-            // Only run if: file doesn't exist, OR (has no answer AND didn't timeout)
-            if (!fs.existsSync(resultPath) || (!hasAnswer && !hasTimedOut)) {
+            // 统一口径
+            if (isUnfinishedDefault(runExists, runData)) {
                 filteredTasks.push(task);
             }
         }
@@ -642,130 +690,348 @@ program
         await showStats(options.verbose || false, resultsPath);
     });
 
-async function showStats(verbose: boolean = false, resultsPath: string = "results/default") {
-    const resultsDir = resultsPath;
-    if (!fs.existsSync(resultsDir)) {
-        console.log(`No results directory found at: ${resultsDir}`);
-        return;
+function summarize(arr: number[]) {
+    const n = arr.length;
+    if (n === 0) {
+        return { n: 0, min: 0, max: 0, mean: 0, median: 0 };
     }
+    const sorted = [...arr].sort((a, b) => a - b);
+    const sum = arr.reduce((a, b) => a + b, 0);
+    const mean = sum / n;
+    const median =
+        n % 2 === 1
+            ? sorted[(n - 1) / 2]!
+            : (sorted[n / 2 - 1]! + sorted[n / 2]!) / 2;
 
-    const files = fs.readdirSync(resultsDir);
-    const evalFiles = files.filter(f => f.endsWith(".eval.json"));
+    return {
+        n,
+        min: sorted[0]!,
+        max: sorted[n - 1]!,
+        mean,
+        median,
+    };
+}
 
-    if (evalFiles.length === 0) {
-        console.log("No evaluation results found.");
-        return;
+async function showStats(
+  verbose: boolean = false,
+  resultsPath: string = "results/default",
+) {
+  const resultsDir = resultsPath;
+  if (!fs.existsSync(resultsDir)) {
+    console.log(`No results directory found at: ${resultsDir}`);
+    return;
+  }
+
+  const files = fs.readdirSync(resultsDir);
+  const evalFiles = files.filter((f) => f.endsWith(".eval.json"));
+
+  if (evalFiles.length === 0) {
+    console.log("No evaluation results found.");
+    return;
+  }
+
+  const levelMap = await getTaskLevelMap(TASKS_PATH);
+
+  const levelStats = new Map<string, { total: number; success: number }>();
+  for (const lv of ["easy", "medium", "hard", "unknown"]) {
+    levelStats.set(lv, { total: 0, success: 0 });
+  }
+
+  const categoryStats = new Map<
+    string,
+    {
+      total: number;
+      success: number;
+
+      // Avg actions only computed from tasks that have id.json
+      totalActions: number;
+      actionsCounted: number;
+
+      actionCounts: number[];
+      timesMs: number[];
+      inputTokens: number[];
+      outputTokens: number[];
+
+      tasks?: Array<{
+        taskId: string;
+        success: boolean;
+        actions?: number;
+        timeMs?: number;
+        inputTokens?: number;
+        outputTokens?: number;
+      }>;
     }
+  >();
 
-    const categoryStats = new Map<string, {
-        total: number;
-        success: number;
-        totalActions: number;
-        tasks?: Array<{
-            taskId: string;
-            success: boolean;
-            actions: number;
-            time: number;
-        }>;
-    }>();
+  // overall arrays (only from id.json)
+  const allActionCounts: number[] = [];
+  const allTimesMs: number[] = [];
+  const allInputTokens: number[] = [];
+  const allOutputTokens: number[] = [];
 
-    for (const evalFile of evalFiles) {
-        const taskId = evalFile.replace(".eval.json", "");
-        const evalPath = path.join(resultsDir, evalFile);
-        const resultPath = path.join(resultsDir, `${taskId}.json`);
+  let tasksWithRunStats = 0;
 
-        try {
-            const evalData = JSON.parse(fs.readFileSync(evalPath, "utf-8"));
-            const isSuccess = evalData.result === "SUCCESS";
+  // Unfinished breakdown counters (mutually exclusive, default rerun criteria)
+  let unfinishedTasks = 0;
 
-            // WebVoyager task ids look like "Category--num"
-            // Online-Mind2Web ids may be hash-like without "--"
-            const category = taskId.includes("--") ? taskId.split("--")[0]! : "online_mind2web";
+  let noRunFileTasks = 0;         // missing run stats json
+  let initGotoTimeoutTasks = 0;   // zero actions + init goto timeout error
+  let zeroActionsOtherTasks = 0;  // zero actions but not init goto timeout
+  let noAnswerNoTimeoutTasks = 0; // no answer + not timed out
 
-            if (!categoryStats.has(category)) {
-                categoryStats.set(category, {
-                    total: 0,
-                    success: 0,
-                    totalActions: 0,
-                    tasks: verbose ? [] : undefined,
-                });
-            }
+  // Tracked info (NOT part of default unfinished)
+  let timedOutTasks = 0;
 
-            const stats = categoryStats.get(category)!;
-            stats.total += 1;
-            if (isSuccess) {
-                stats.success += 1;
-            }
+  for (const evalFile of evalFiles) {
+    const taskId = evalFile.replace(".eval.json", "");
+    const evalPath = path.join(resultsDir, evalFile);
+    const runPath = path.join(resultsDir, `${taskId}.json`);
 
-            let taskActions = 0;
-            let taskTime = 0;
+    try {
+      const evalData = JSON.parse(fs.readFileSync(evalPath, "utf-8"));
+      const isSuccess = evalData.result === "SUCCESS";
 
-            if (fs.existsSync(resultPath)) {
-                const resultData = JSON.parse(fs.readFileSync(resultPath, "utf-8"));
-                taskActions = resultData.actionCount || 0;
-                taskTime = resultData.time || 0;
+      const category = taskId.includes("--")
+        ? taskId.split("--")[0]!
+        : "online_mind2web";
 
-                stats.totalActions += taskActions;
-            }
+      const level = levelMap.get(taskId) ?? "unknown";
+      if (!levelStats.has(level)) {
+        levelStats.set(level, { total: 0, success: 0 });
+      }
 
-            if (verbose && stats.tasks) {
-                stats.tasks.push({
-                    taskId,
-                    success: isSuccess,
-                    actions: taskActions,
-                    time: taskTime,
-                });
-            }
-        } catch (error) {
-            console.error(`Error processing ${evalFile}:`, error);
+      const ls = levelStats.get(level)!;
+      ls.total += 1;
+      if (isSuccess) ls.success += 1;
+
+      if (!categoryStats.has(category)) {
+        categoryStats.set(category, {
+          total: 0,
+          success: 0,
+          totalActions: 0,
+          actionsCounted: 0,
+          actionCounts: [],
+          timesMs: [],
+          inputTokens: [],
+          outputTokens: [],
+          tasks: verbose ? [] : undefined,
+        });
+      }
+
+      const stats = categoryStats.get(category)!;
+      stats.total += 1;
+      if (isSuccess) stats.success += 1;
+
+      const runExists = fs.existsSync(runPath);
+      let runData: any = null;
+
+      if (runExists) {
+        runData = JSON.parse(fs.readFileSync(runPath, "utf-8"));
+      }
+
+    if (runData) {
+        const sig = extractRunSignals(runData);
+
+        const taskActions = sig.actionCount;
+        const taskTimeMs = Number(runData.time ?? 0);
+        const taskInTokens = Number(runData.totalInputTokens ?? 0);
+        const taskOutTokens = Number(runData.totalOutputTokens ?? 0);
+
+        // ===== timed out 作为信息项单独统计 =====
+        if (sig.hasTimedOut) {
+            timedOutTasks += 1;
         }
-    }
 
-    console.log("\n=== Evaluation Statistics by Category ===\n");
-    console.log("Category         | Success Rate      | Avg Actions");
-    console.log("-----------------|-------------------|------------");
+        // ===== default unfinished: mutually exclusive reasons =====
+        // 口径与默认重跑一致：
+        //   - zero actions
+        //   - or no answer AND not timed out
+        if (sig.hasZeroActions) {
+            if (sig.isInitGotoTimeout) {
+            initGotoTimeoutTasks += 1;
+            } else {
+            zeroActionsOtherTasks += 1;
+            }
+            unfinishedTasks += 1;
+        } else if (!sig.hasAnswer && !sig.hasTimedOut) {
+            noAnswerNoTimeoutTasks += 1;
+            unfinishedTasks += 1;
+        }
 
-    let totalTasks = 0;
-    let totalSuccess = 0;
-    let totalActions = 0;
+        // ===== 你之前丢掉的聚合逻辑放这里 =====
+        tasksWithRunStats += 1;
 
-    for (const [category, stats] of categoryStats) {
-        const successRate = (stats.success / stats.total) * 100;
-        const avgActions = stats.totalActions / stats.total;
+        stats.totalActions += taskActions;
+        stats.actionsCounted += 1;
 
-        console.log(
-            `${category.padEnd(16)} | ${stats.success}/${stats.total} (${successRate.toFixed(1)}%)`.padEnd(37) +
-            ` | ${avgActions.toFixed(1).padStart(10)}`,
-        );
+        stats.actionCounts.push(taskActions);
+        stats.timesMs.push(taskTimeMs);
+        stats.inputTokens.push(taskInTokens);
+        stats.outputTokens.push(taskOutTokens);
+
+        allActionCounts.push(taskActions);
+        allTimesMs.push(taskTimeMs);
+        allInputTokens.push(taskInTokens);
+        allOutputTokens.push(taskOutTokens);
 
         if (verbose && stats.tasks) {
-            stats.tasks.sort((a, b) => a.taskId.localeCompare(b.taskId));
-
-            for (const task of stats.tasks) {
-                const timeMin = (task.time / 1000 / 60).toFixed(1);
-                const status = task.success ? "✓" : "✗";
-                console.log(
-                    `  ${status} ${task.taskId.padEnd(20)} | Actions: ${task.actions.toString().padStart(3)} | Time: ${timeMin.padStart(5)} min`,
-                );
-            }
-            console.log();
+            stats.tasks.push({
+            taskId,
+            success: isSuccess,
+            actions: taskActions,
+            timeMs: taskTimeMs,
+            inputTokens: taskInTokens,
+            outputTokens: taskOutTokens,
+            });
         }
+    } else {
+        // eval exists but run stats json missing
+        noRunFileTasks += 1;
+        unfinishedTasks += 1;
 
-        totalTasks += stats.total;
-        totalSuccess += stats.success;
-        totalActions += stats.totalActions;
+        if (verbose && stats.tasks) {
+            stats.tasks.push({
+            taskId,
+            success: isSuccess,
+            });
+        }
     }
+    } catch (error) {
+      console.error(`Error processing ${evalFile}:`, error);
+    }
+  }
 
-    console.log("-----------------|-------------------|------------");
-    const overallSuccessRate = (totalSuccess / totalTasks) * 100;
-    const overallAvgActions = totalActions / totalTasks;
+  // ===== Category table =====
+  console.log("\n=== Evaluation Statistics by Category ===\n");
+  console.log("Category         | Success Rate      | Avg Actions");
+  console.log("-----------------|-------------------|------------");
+
+  let totalTasks = 0;
+  let totalSuccess = 0;
+
+  for (const [category, stats] of categoryStats) {
+    const successRate = (stats.success / stats.total) * 100;
+    const avgActions =
+      stats.actionsCounted > 0
+        ? stats.totalActions / stats.actionsCounted
+        : 0;
 
     console.log(
-        `${"TOTAL".padEnd(16)} | ${totalSuccess}/${totalTasks} (${overallSuccessRate.toFixed(1)}%)`.padEnd(37) +
-        ` | ${overallAvgActions.toFixed(1).padStart(10)}`,
+      `${category.padEnd(16)} | ${stats.success}/${stats.total} (${successRate.toFixed(1)}%)`.padEnd(
+        37,
+      ) + ` | ${avgActions.toFixed(1).padStart(10)}`,
     );
 
-    console.log(`\nTotal evaluated tasks: ${totalTasks}`);
+    if (verbose && stats.tasks) {
+      stats.tasks.sort((a, b) => a.taskId.localeCompare(b.taskId));
+      for (const task of stats.tasks) {
+        const status = task.success ? "✓" : "✗";
+        if (task.actions == null) {
+          console.log(`  ${status} ${task.taskId.padEnd(20)} | (no run stats json)`);
+        } else {
+          const timeMin = ((task.timeMs ?? 0) / 1000 / 60).toFixed(1);
+          console.log(
+            `  ${status} ${task.taskId.padEnd(20)} | Actions: ${task.actions
+              .toString()
+              .padStart(3)} | Time: ${timeMin.padStart(5)} min | InTok: ${(task.inputTokens ?? 0)
+              .toString()
+              .padStart(6)} | OutTok: ${(task.outputTokens ?? 0).toString().padStart(6)}`,
+          );
+        }
+      }
+      console.log();
+    }
+
+    totalTasks += stats.total;
+    totalSuccess += stats.success;
+  }
+
+  console.log("-----------------|-------------------|------------");
+  const overallSuccessRate = (totalSuccess / totalTasks) * 100;
+
+  // overall avg actions only over tasks with run stats
+  const overallAvgActions =
+    tasksWithRunStats > 0
+      ? allActionCounts.reduce((a, b) => a + b, 0) / tasksWithRunStats
+      : 0;
+
+  console.log(
+    `${"TOTAL".padEnd(16)} | ${totalSuccess}/${totalTasks} (${overallSuccessRate.toFixed(1)}%)`.padEnd(
+      37,
+    ) + ` | ${overallAvgActions.toFixed(1).padStart(10)}`,
+  );
+
+  console.log("\n=== Accuracy by Level ===\n");
+
+  const preferredOrder = ["easy", "medium", "hard", "unknown"];
+  for (const lv of preferredOrder) {
+    const s = levelStats.get(lv);
+    if (!s || s.total === 0) continue;
+    const rate = (s.success / s.total) * 100;
+    console.log(`${lv.padEnd(8)} | ${s.success}/${s.total} (${rate.toFixed(1)}%)`);
+  }
+
+  // 如果你想把所有“非标准 level”也打出来：
+  for (const [lv, s] of levelStats) {
+    if (preferredOrder.includes(lv)) continue;
+    if (s.total === 0) continue;
+    const rate = (s.success / s.total) * 100;
+    console.log(`${lv.padEnd(8)} | ${s.success}/${s.total} (${rate.toFixed(1)}%)`);
+  }
+
+  // ===== New overall metric statistics =====
+  const timeMinutes = allTimesMs.map((ms) => ms / 1000 / 60);
+
+  const timeStats = summarize(timeMinutes);
+  const actionStats = summarize(allActionCounts);
+  const inTokStats = summarize(allInputTokens);
+  const outTokStats = summarize(allOutputTokens);
+
+  console.log("\n=== Overall Task Metric Statistics ===\n");
+  console.log(`Evaluated tasks: ${totalTasks}`);
+  console.log(`Tasks with run stats json: ${tasksWithRunStats}/${totalTasks}\n`);
+
+  // Unfinished summary first (as requested)
+  console.log(`Unfinished tasks (default rerun criteria): ${unfinishedTasks}/${totalTasks}`);
+
+  // Unfinished breakdown (some categories may overlap)
+  console.log(`  - No run stats json: ${noRunFileTasks}/${totalTasks}`);
+  console.log(`  - Init goto timeout (zero actions): ${initGotoTimeoutTasks}/${totalTasks}`);
+  console.log(`  - Zero actions (other): ${zeroActionsOtherTasks}/${totalTasks}`);
+  console.log(`  - No answer (has actions, not timed out): ${noAnswerNoTimeoutTasks}/${totalTasks}`);
+  console.log(`Timed out tasks: ${timedOutTasks}/${totalTasks}\n`);
+
+  console.log("Metric                |   Min   |   Max   |   Mean  |  Median");
+  console.log("----------------------|---------|---------|---------|---------");
+  console.log(
+    `Time (min)            | ${timeStats.min.toFixed(1).padStart(7)} | ${timeStats.max
+      .toFixed(1)
+      .padStart(7)} | ${timeStats.mean.toFixed(1).padStart(7)} | ${timeStats.median
+      .toFixed(1)
+      .padStart(7)}`,
+  );
+  console.log(
+    `Action count          | ${actionStats.min.toFixed(1).padStart(7)} | ${actionStats.max
+      .toFixed(1)
+      .padStart(7)} | ${actionStats.mean.toFixed(1).padStart(7)} | ${actionStats.median
+      .toFixed(1)
+      .padStart(7)}`,
+  );
+  console.log(
+    `Total input tokens    | ${inTokStats.min.toFixed(1).padStart(7)} | ${inTokStats.max
+      .toFixed(1)
+      .padStart(7)} | ${inTokStats.mean.toFixed(1).padStart(7)} | ${inTokStats.median
+      .toFixed(1)
+      .padStart(7)}`,
+  );
+  console.log(
+    `Total output tokens   | ${outTokStats.min.toFixed(1).padStart(7)} | ${outTokStats.max
+      .toFixed(1)
+      .padStart(7)} | ${outTokStats.mean.toFixed(1).padStart(7)} | ${outTokStats.median
+      .toFixed(1)
+      .padStart(7)}`,
+  );
 }
+
 
 program.parseAsync().catch(console.error);

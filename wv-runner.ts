@@ -120,6 +120,9 @@ async function main() {
             deviceScaleFactor: process.platform === 'darwin' ? 2 : 1
         });
 
+        context.setDefaultNavigationTimeout(90_000);
+        context.setDefaultTimeout(90_000);
+
         agent = await startBrowserAgent({
             browser: { context: context },
             llm: {
