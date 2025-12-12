@@ -286,6 +286,7 @@ function extractRunSignals(runData: RunData) {
 
   let hasAnswer = false;
   if (runData?.memory && Array.isArray(runData.memory.observations)) {
+    // check whether has an answer
     hasAnswer = runData.memory.observations.some(
       (obs: any) => obs.source === "action:taken:answer",
     );
@@ -355,14 +356,17 @@ async function filterTasksByOptions(tasks: Task[], options: RunOptions): Promise
     return filteredTasks;
 }
 
+// evaluate one task
 async function evalTask(taskId: string, resultsPath: string = "results/default") {
     const task = (await findTaskById(TASKS_PATH, taskId))!;
 
     const memoryPath = path.join(resultsPath, `${task.id}.json`);
     //const memJson = JSON.parse(fs.readFileSync(memoryPath, "utf-8")).memory;
     const raw = JSON.parse(fs.readFileSync(memoryPath, "utf-8"));
+    // memJson is the memory field of json file
     const memJson = raw?.memory;
 
+    // skip the task if memory is empty or observations is not an array
     if (!memJson || !Array.isArray(memJson.observations)) {
         console.warn(`[Eval] Skip task ${task.id}: invalid memory shape`);
         return;
@@ -393,6 +397,7 @@ async function evalTask(taskId: string, resultsPath: string = "results/default")
         },
     });
     await agent.start();
+    // load the saved memory into the judge's memory
     await agent.memory.loadJSON(memJson);
 
     const evalResult = await agent.query(
