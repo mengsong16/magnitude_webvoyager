@@ -7,6 +7,7 @@ import { Command } from "commander";
 import * as p from "@clack/prompts";
 import { Agent } from "magnitude-core";
 import { spawn } from "node:child_process";
+import { DEFAULT_NAVIGATION_TIMEOUT_MS } from "./wv-constants";
 
 const DEFAULT_DATASET_FILE = "patchedTasks.jsonl";
 const DEFAULT_RESULTS_DIR = "default";
@@ -294,7 +295,7 @@ function extractRunSignals(runData: RunData) {
 
   const errMsg = String(runData?.error ?? runData?.err ?? "");
   const isInitGotoTimeout =
-    hasZeroActions && errMsg.includes("goto: Timeout 30000ms exceeded");
+    hasZeroActions && /goto:\s*Timeout\s*\d+ms\s*exceeded/i.test(errMsg);
 
   return { actionCount, hasZeroActions, hasTimedOut, hasAnswer, isInitGotoTimeout };
 }
@@ -779,7 +780,7 @@ async function showStats(
   // Unfinished breakdown counters (mutually exclusive, default rerun criteria)
   let unfinishedTasks = 0;
 
-  let noRunFileTasks = 0;         // missing run stats json
+  let noRunFileTasks = 0;         // missing run json
   let initGotoTimeoutTasks = 0;   // zero actions + init goto timeout error
   let zeroActionsOtherTasks = 0;  // zero actions but not init goto timeout
   let noAnswerNoTimeoutTasks = 0; // no answer + not timed out
@@ -863,7 +864,6 @@ async function showStats(
             unfinishedTasks += 1;
         }
 
-        // ===== 你之前丢掉的聚合逻辑放这里 =====
         tasksWithRunStats += 1;
 
         stats.totalActions += taskActions;
@@ -932,7 +932,7 @@ async function showStats(
       for (const task of stats.tasks) {
         const status = task.success ? "✓" : "✗";
         if (task.actions == null) {
-          console.log(`  ${status} ${task.taskId.padEnd(20)} | (no run stats json)`);
+          console.log(`  ${status} ${task.taskId.padEnd(20)} | (no run json)`);
         } else {
           const timeMin = ((task.timeMs ?? 0) / 1000 / 60).toFixed(1);
           console.log(
@@ -954,34 +954,48 @@ async function showStats(
   console.log("-----------------|-------------------|------------");
   const overallSuccessRate = (totalSuccess / totalTasks) * 100;
 
-  // overall avg actions only over tasks with run stats
+  // overall avg actions only over tasks with run json
   const overallAvgActions =
     tasksWithRunStats > 0
       ? allActionCounts.reduce((a, b) => a + b, 0) / tasksWithRunStats
       : 0;
 
+  // overall success rate is over all evaluated tasks
   console.log(
     `${"TOTAL".padEnd(16)} | ${totalSuccess}/${totalTasks} (${overallSuccessRate.toFixed(1)}%)`.padEnd(
       37,
     ) + ` | ${overallAvgActions.toFixed(1).padStart(10)}`,
   );
 
-  console.log("\n=== Accuracy by Level ===\n");
-
-  const preferredOrder = ["easy", "medium", "hard", "unknown"];
-  for (const lv of preferredOrder) {
-    const s = levelStats.get(lv);
-    if (!s || s.total === 0) continue;
-    const rate = (s.success / s.total) * 100;
-    console.log(`${lv.padEnd(8)} | ${s.success}/${s.total} (${rate.toFixed(1)}%)`);
+  // ===== Accuracy by Level =====
+  // 如果数据集没有 level/difficulty 字段，getTaskLevelMap 会把它们都归为 "unknown"
+  // 这种情况下不打印该块，避免输出一条 "unknown | ..."
+  let hasAnyKnownLevel = false;
+  for (const [lv, s] of levelStats) {
+    if (lv !== "unknown" && s.total > 0) {
+      hasAnyKnownLevel = true;
+      break;
+    }
   }
 
-  // 如果你想把所有“非标准 level”也打出来：
-  for (const [lv, s] of levelStats) {
-    if (preferredOrder.includes(lv)) continue;
-    if (s.total === 0) continue;
-    const rate = (s.success / s.total) * 100;
-    console.log(`${lv.padEnd(8)} | ${s.success}/${s.total} (${rate.toFixed(1)}%)`);
+  if (hasAnyKnownLevel) {
+    console.log("\n=== Accuracy by Level ===\n");
+
+    const preferredOrder = ["easy", "medium", "hard", "unknown"];
+    for (const lv of preferredOrder) {
+      const s = levelStats.get(lv);
+      if (!s || s.total === 0) continue;
+      const rate = (s.success / s.total) * 100;
+      console.log(`${lv.padEnd(8)} | ${s.success}/${s.total} (${rate.toFixed(1)}%)`);
+    }
+
+    // 打印所有“非标准 level”（如果你的数据集里有）
+    for (const [lv, s] of levelStats) {
+      if (preferredOrder.includes(lv)) continue;
+      if (s.total === 0) continue;
+      const rate = (s.success / s.total) * 100;
+      console.log(`${lv.padEnd(8)} | ${s.success}/${s.total} (${rate.toFixed(1)}%)`);
+    }
   }
 
   // ===== New overall metric statistics =====
@@ -993,17 +1007,21 @@ async function showStats(
   const outTokStats = summarize(allOutputTokens);
 
   console.log("\n=== Overall Task Metric Statistics ===\n");
-  console.log(`Evaluated tasks: ${totalTasks}`);
-  console.log(`Tasks with run stats json: ${tasksWithRunStats}/${totalTasks}\n`);
+  // totalTasks: tasks with eval.json
+  console.log(`Evaluated tasks (tasks with eval json): ${totalTasks}\n`);
+  console.log(`Tasks with run json: ${tasksWithRunStats}\n`);
 
   // Unfinished summary first (as requested)
   console.log(`Unfinished tasks (default rerun criteria): ${unfinishedTasks}/${totalTasks}`);
 
   // Unfinished breakdown (some categories may overlap)
-  console.log(`  - No run stats json: ${noRunFileTasks}/${totalTasks}`);
-  console.log(`  - Init goto timeout (zero actions): ${initGotoTimeoutTasks}/${totalTasks}`);
-  console.log(`  - Zero actions (other): ${zeroActionsOtherTasks}/${totalTasks}`);
-  console.log(`  - No answer (has actions, not timed out): ${noAnswerNoTimeoutTasks}/${totalTasks}`);
+  const zeroActionsTasks = initGotoTimeoutTasks + zeroActionsOtherTasks;
+  console.log(`  - No run json: ${noRunFileTasks}/${totalTasks}`);
+  console.log(`  - Zero actions: ${zeroActionsTasks}/${totalTasks}`);
+  console.log(`    - Init goto timeout: ${initGotoTimeoutTasks}`);
+  console.log(`    - Others: ${zeroActionsOtherTasks}`);
+  console.log(`  - No answer (has actions, not timed out): ${noAnswerNoTimeoutTasks}/${totalTasks}\n`);
+  
   console.log(`Timed out tasks: ${timedOutTasks}/${totalTasks}\n`);
 
   console.log("Metric                |   Min   |   Max   |   Mean  |  Median");

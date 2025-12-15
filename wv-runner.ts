@@ -7,6 +7,11 @@ import { createAction } from "magnitude-core";
 import z from "zod";
 import { chromium } from "patchright";
 
+import {
+        DEFAULT_NAVIGATION_TIMEOUT_MS,
+        DEFAULT_ACTION_TIMEOUT_MS,
+    } from "./wv-constants";
+
 interface Task {
     web_name: string;
     id: string;
@@ -26,6 +31,8 @@ async function main() {
     
     const task: Task = JSON.parse(taskJson);
     const MAX_CRASH_RETRIES = 3;
+    
+    
     let crashAttempts = 0;
     
     // Ensure results directory exists
@@ -111,103 +118,113 @@ async function main() {
                 month: 'long',
                 day: 'numeric',
                 year: 'numeric'
-        });
+            });
 
-        context = await chromium.launchPersistentContext("", {
-            channel: "chrome",
-            headless: false,
-            viewport: { width: 1024, height: 768 },
-            deviceScaleFactor: process.platform === 'darwin' ? 2 : 1
-        });
+            context = await chromium.launchPersistentContext("", {
+                channel: "chrome",
+                headless: false,
+                viewport: { width: 1024, height: 768 },
+                deviceScaleFactor: process.platform === 'darwin' ? 2 : 1
+            });
 
-        context.setDefaultNavigationTimeout(90_000);
-        context.setDefaultTimeout(90_000);
+            context.setDefaultNavigationTimeout(DEFAULT_NAVIGATION_TIMEOUT_MS);
+            context.setDefaultTimeout(DEFAULT_ACTION_TIMEOUT_MS);
 
-        agent = await startBrowserAgent({
-            browser: { context: context },
-            llm: {
-                // provider: 'openai-generic',
-                // options: {
-                //     baseUrl: 'https://openrouter.ai/api/v1',
-                //     // model: 'bytedance/ui-tars-1.5-7b',
-                //     model: 'z-ai/glm-4.5v',
-                //     // model: 'meta-llama/llama-4-maverick',
-                //     apiKey: process.env.OPENROUTER_API_KEY,
-                //     // temperature: 0.1
-                // },
-                // options: {
-                //     baseUrl: 'https://openrouter.ai/api/v1',
-                //     // model: 'qwen/qwen2.5-vl-72b-instruct',
-                //     model: 'qwen/qwen3-vl-30b-a3b-instruct',
-                //     apiKey: process.env.OPENROUTER_API_KEY
-                // }
-                provider: 'anthropic', // your provider of choice
-                options: {
-                    // any required + optional configuration for that provider
-                    model: 'claude-sonnet-4-5-20250929',
-                    apiKey: process.env.ANTHROPIC_API_KEY
-                }
-            },
-            url: task.web,
-            actions: [
-                createAction({
-                    name: "answer",
-                    description: "Give final answer",
-                    schema: z.string(),
-                    resolver: async ({ input, agent }) => {
-                        console.log("ANSWER GIVEN:", input);
-                        await agent.queueDone();
-                    },
-                }),
-            ],
-            narrate: true,
-            prompt: `Be careful to satisfy the task criteria precisely. If sequences of actions are failing, go one action at at time.\nConsider that today is ${formattedDate}.\n\nFor scrolling: positive deltaY values scroll DOWN (to see content below), negative deltaY values scroll UP (to see content above).`,
-            // screenshotMemoryLimit: 3,
-        });
 
-        agent.events.on("tokensUsed", async (usage: ModelUsage) => {
-            totalInputTokens += usage.inputTokens;
-            totalOutputTokens += usage.outputTokens;
-        });
+            agent = await startBrowserAgent({
+                browser: { context: context },
+                llm: {
+                    // provider: 'openai-generic',
+                    // options: {
+                    //     baseUrl: 'https://openrouter.ai/api/v1',
+                    //     // model: 'bytedance/ui-tars-1.5-7b',
+                    //     model: 'z-ai/glm-4.5v',
+                    //     // model: 'meta-llama/llama-4-maverick',
+                    //     apiKey: process.env.OPENROUTER_API_KEY,
+                    //     // temperature: 0.1
+                    // },
+                    // options: {
+                    //     baseUrl: 'https://openrouter.ai/api/v1',
+                    //     // model: 'qwen/qwen2.5-vl-72b-instruct',
+                    //     model: 'qwen/qwen3-vl-30b-a3b-instruct',
+                    //     apiKey: process.env.OPENROUTER_API_KEY
+                    // }
+                    provider: 'anthropic', // your provider of choice
+                    options: {
+                        // any required + optional configuration for that provider
+                        model: 'claude-sonnet-4-5-20250929',
+                        apiKey: process.env.ANTHROPIC_API_KEY
+                    }
+                },
+                url: task.web,
+                actions: [
+                    createAction({
+                        name: "answer",
+                        description: "Give final answer",
+                        schema: z.string(),
+                        resolver: async ({ input, agent }) => {
+                            console.log("ANSWER GIVEN:", input);
+                            await agent.queueDone();
+                        },
+                    }),
+                ],
+                narrate: true,
+                prompt: `Be careful to satisfy the task criteria precisely. If sequences of actions are failing, go one action at at time.\nConsider that today is ${formattedDate}.\n\nFor scrolling: positive deltaY values scroll DOWN (to see content below), negative deltaY values scroll UP (to see content above).`,
+                // screenshotMemoryLimit: 3,
+            });
 
-        agent.events.on("actionDone", async () => {
-            let memory: any = null;
+            agent.events.on("tokensUsed", async (usage: ModelUsage) => {
+                totalInputTokens += usage.inputTokens;
+                totalOutputTokens += usage.outputTokens;
+            });
+
+            agent.events.on("actionDone", async () => {
+                let memory: any = null;
+                try {
+                    memory = await agent.memory.toJSON();
+                } catch {}
+
+                const safeMemory = (memory && Array.isArray(memory.observations))
+                    ? memory
+                    : { observations: [] };
+
+                actionCount += 1;
+
+                fs.writeFileSync(
+                    path.join(resultsPath, `${task.id}.json`),
+                    JSON.stringify(
+                        {
+                            time: Date.now() - startTime,
+                            actionCount,
+                            totalInputTokens,
+                            totalOutputTokens,
+                            memory: safeMemory,
+                        },
+                        null,
+                        4,
+                    ),
+                );
+            });
+
+            // Set up timeout
+            const TIMEOUT_MIN = 20;
+            const TIMEOUT_MS = TIMEOUT_MIN * 60 * 1000;
+
+            let timer: NodeJS.Timeout | null = null;
+
             try {
-                memory = await agent.memory.toJSON();
-            } catch {}
+                await Promise.race([
+                    agent.act(task.ques),
+                    new Promise<void>((_, reject) => {
+                    timer = setTimeout(() => {
+                        reject(new Error(`Task timed out after ${TIMEOUT_MIN} minutes`));
+                    }, TIMEOUT_MS);
+                    }),
+                ]);
+            } finally {
+                if (timer) clearTimeout(timer);
+            }
 
-            const safeMemory = (memory && Array.isArray(memory.observations))
-                ? memory
-                : { observations: [] };
-
-            actionCount += 1;
-
-            fs.writeFileSync(
-                path.join(resultsPath, `${task.id}.json`),
-                JSON.stringify(
-                    {
-                        time: Date.now() - startTime,
-                        actionCount,
-                        totalInputTokens,
-                        totalOutputTokens,
-                        memory: safeMemory,
-                    },
-                    null,
-                    4,
-                ),
-            );
-        });
-
-        // Set up timeout
-        const TIMEOUT_MS = 20 * 60 * 1000; // 20 minutes
-        await Promise.race([
-            agent.act(task.ques),
-            new Promise<void>((_, reject) => {
-                setTimeout(() => {
-                    reject(new Error(`Task timed out after 20 minutes`));
-                }, TIMEOUT_MS);
-            })
-        ]);
 
             console.log(`[Runner] Finished task: ${task.id}`);
             

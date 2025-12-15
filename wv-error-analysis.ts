@@ -447,7 +447,7 @@ ${trajSummary}
       if (cat === "NO_ANSWER") {
         const timeoutCount = noAnswerTimedOutIds.length;
         console.log(
-          `${cat}: ${ids.length} task(s), timedOut: ${timeoutCount}`,
+          `${cat}: ${ids.length} task(s) (of which ${timeoutCount} timed out)`,
         );
         if (ids.length > 0) {
           console.log(`  ids: ${ids.join(", ")}`);
