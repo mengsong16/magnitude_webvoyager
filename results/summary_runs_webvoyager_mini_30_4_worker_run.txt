@@ -1,0 +1,44 @@
+
+=== Run: results/webvoyager_mini_30_4_worker_run1 ===
+Tasks: 30
+Overall success rate: 0.7333
+Metric                |   Min   |   Max   |   Mean  |  Median
+----------------------|---------|---------|---------|---------
+Time (min)            | 0.4 | 7.4 | 2.1 | 1.7
+Action count          | 2.0 | 48.0 | 11.9 | 8.5
+Total input tokens    | 6.0 | 92.0 | 26.7 | 21.0
+Total output tokens   | 186.0 | 8301.0 | 1839.4 | 1501.0
+
+=== Run: results/webvoyager_mini_30_4_worker_run2 ===
+Tasks: 30
+Overall success rate: 0.9000
+Metric                |   Min   |   Max   |   Mean  |  Median
+----------------------|---------|---------|---------|---------
+Time (min)            | 0.4 | 18.1 | 2.7 | 1.5
+Action count          | 2.0 | 131.0 | 16.4 | 8.0
+Total input tokens    | 6.0 | 265.0 | 35.6 | 19.0
+Total output tokens   | 405.0 | 23908.0 | 2728.0 | 1191.0
+
+=== Run: results/webvoyager_mini_30_4_worker_run3 ===
+Tasks: 30
+Overall success rate: 0.8000
+Metric                |   Min   |   Max   |   Mean  |  Median
+----------------------|---------|---------|---------|---------
+Time (min)            | 0.4 | 20.3 | 3.5 | 1.4
+Action count          | 2.0 | 133.0 | 19.6 | 8.5
+Total input tokens    | 5.0 | 205.0 | 39.4 | 20.0
+Total output tokens   | 217.0 | 20055.0 | 3186.6 | 1301.0
+
+===== Across-runs (mean ± std over runs) =====
+----------------------------------------------
+Success rate        : 0.8111 ± 0.0839
+----------------------------------------------
+Time mean (min)     : 2.777 ± 0.689
+Action mean         : 15.944 ± 3.884
+Input tokens mean   : 33.922 ± 6.537
+Output tokens mean  : 2584.667 ± 684.975
+----------------------------------------------
+Time median (min)   : 1.542 ± 0.147
+Action median       : 8.333 ± 0.289
+Input tokens median : 20.000 ± 1.000
+Output tokens median: 1331.000 ± 157.162

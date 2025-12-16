@@ -1,0 +1,45 @@
+
+=== Evaluation Statistics by Category ===
+
+Category         | Success Rate      | Avg Actions
+-----------------|-------------------|------------
+Google Map       | 2/2 (100.0%)       |       20.0
+Wolfram Alpha    | 2/2 (100.0%)       |        7.0
+Amazon           | 1/2 (50.0%)        |       11.0
+Huggingface      | 2/2 (100.0%)       |       74.5
+Cambridge Dictionary | 2/2 (100.0%)   |        8.0
+Booking          | 1/2 (50.0%)        |        9.0
+Google Flights   | 1/2 (50.0%)        |       11.0
+BBC News         | 2/2 (100.0%)       |        8.0
+ESPN             | 2/2 (100.0%)       |        8.5
+GitHub           | 2/2 (100.0%)       |        4.0
+Apple            | 2/2 (100.0%)       |        7.0
+ArXiv            | 2/2 (100.0%)       |       51.5
+Coursera         | 2/2 (100.0%)       |        8.5
+Google Search    | 2/2 (100.0%)       |        6.5
+Allrecipes       | 2/2 (100.0%)       |       11.0
+-----------------|-------------------|------------
+TOTAL            | 27/30 (90.0%)      |       16.4
+
+=== Overall Task Metric Statistics ===
+
+Evaluated tasks (tasks with eval json): 30
+
+Tasks with run json: 30
+
+Unfinished tasks (default rerun criteria): 2/30
+  - No run json: 0/30
+  - Zero actions: 0/30
+    - Init goto timeout: 0
+    - Others: 0
+  - No answer (has actions, not timed out): 2/30
+
+Timed out tasks: 0/30
+
+Metric                |   Min   |   Max   |   Mean  |  Median
+----------------------|---------|---------|---------|---------
+Time (min)            |     0.4 |    18.1 |     2.7 |     1.5
+Action count          |     2.0 |   131.0 |    16.4 |     8.0
+Total input tokens    |     6.0 |   265.0 |    35.6 |    19.0
+Total output tokens   |   405.0 | 23908.0 |  2728.0 |  1191.0
+

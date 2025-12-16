@@ -718,6 +718,32 @@ function summarize(arr: number[]) {
     };
 }
 
+function formatTimeMmSs(ms: number): string {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}m ${s}s`;
+}
+
+function writeTaskSpeedTxt(
+  resultsDir: string,
+  rows: Array<{ taskId: string; actions: number; timeMs: number }>,
+) {
+  const outPath = path.join(resultsDir, "task_speed.txt");
+
+  // deterministic order
+  rows.sort((a, b) => a.taskId.localeCompare(b.taskId));
+
+  const header = "task_id\t\t\tactions\t\t\ttime\n";
+  const lines = rows.map((r) => {
+    //const timeMin = (r.timeMs / 1000 / 60).toFixed(2);
+    const timeMmSs = formatTimeMmSs(r.timeMs);
+    return `${r.taskId}\t\t\t${r.actions}\t\t\t${timeMmSs}`;
+  });
+
+  fs.writeFileSync(outPath, header + lines.join("\n") + "\n", "utf-8");
+}
+
 async function showStats(
   verbose: boolean = false,
   resultsPath: string = "results/default",
@@ -774,6 +800,9 @@ async function showStats(
   const allTimesMs: number[] = [];
   const allInputTokens: number[] = [];
   const allOutputTokens: number[] = [];
+
+  // task speed rows (only from id.json)
+  const taskSpeedRows: Array<{ taskId: string; actions: number; timeMs: number }> = [];
 
   let tasksWithRunStats = 0;
 
@@ -843,6 +872,7 @@ async function showStats(
         const taskInTokens = Number(runData.totalInputTokens ?? 0);
         const taskOutTokens = Number(runData.totalOutputTokens ?? 0);
 
+
         // ===== timed out 作为信息项单独统计 =====
         if (sig.hasTimedOut) {
             timedOutTasks += 1;
@@ -878,6 +908,9 @@ async function showStats(
         allTimesMs.push(taskTimeMs);
         allInputTokens.push(taskInTokens);
         allOutputTokens.push(taskOutTokens);
+
+        // For task_speed.txt (written by stats)
+        taskSpeedRows.push({ taskId, actions: taskActions, timeMs: taskTimeMs });
 
         if (verbose && stats.tasks) {
             stats.tasks.push({
@@ -1054,6 +1087,12 @@ async function showStats(
       .toFixed(1)
       .padStart(7)}`,
   );
+
+  // ===== Write per-task speed file =====
+  if (taskSpeedRows.length > 0) {
+    writeTaskSpeedTxt(resultsDir, taskSpeedRows);
+    //console.log(`\nWrote task_speed.txt: ${path.join(resultsDir, "task_speed.txt")}`);
+  }
 }
 
 

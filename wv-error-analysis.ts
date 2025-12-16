@@ -494,7 +494,7 @@ ${trajSummary}
     ),
   );
   console.log(
-    `[ErrorAnalysis] Detailed failure analysis saved to ${outPath}`,
+    `[Error Analysis] Detailed failure analysis saved to ${outPath}`,
   );
 }
 
