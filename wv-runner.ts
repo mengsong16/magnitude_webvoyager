@@ -21,8 +21,18 @@ interface Task {
 
 async function main() {
     const taskJson = process.argv[2];
-    const runEval = process.argv[3] === 'true';
+    const runEval = process.argv[3] === 'true'; // never been used
     const resultsPath = process.argv[4] || 'results/default';
+    const reflectionHintArg = process.argv[5];
+    let reflectionHint: string | null = null;
+    if (reflectionHintArg) {
+        try {
+            reflectionHint = JSON.parse(reflectionHintArg);
+        } catch {
+            reflectionHint = reflectionHintArg;
+        }
+    }
+
     
     if (!taskJson) {
         console.error("No task provided");
@@ -30,6 +40,10 @@ async function main() {
     }
     
     const task: Task = JSON.parse(taskJson);
+    const fullInstruction = reflectionHint
+        ? `${task.ques}\n\n[Reflection feedback from previous attempt]\n${reflectionHint}\n\nTry again and avoid repeating the same mistake. You MUST call the answer action when you have the final result.`
+        : task.ques;
+
     const MAX_CRASH_RETRIES = 3;
     
     
@@ -214,7 +228,7 @@ async function main() {
 
             try {
                 await Promise.race([
-                    agent.act(task.ques),
+                    agent.act(fullInstruction),
                     new Promise<void>((_, reject) => {
                     timer = setTimeout(() => {
                         reject(new Error(`Task timed out after ${TIMEOUT_MIN} minutes`));

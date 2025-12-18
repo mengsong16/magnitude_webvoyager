@@ -15,6 +15,47 @@ const DEFAULT_RESULTS_DIR = "default";
 // Keep TASKS_PATH mutable for minimal changes across helpers
 let TASKS_PATH = path.join(__dirname, "data", DEFAULT_DATASET_FILE);
 
+function appendReflectRecord(
+  resultsPath: string,
+  taskId: string,
+  record: any, // { attempt, eval, suggestion? }
+) {
+  const reflectPath = path.join(resultsPath, `${taskId}.reflect.json`);
+
+  let payload: any = { task_id: taskId, attempts: [] as any[] };
+
+  if (fs.existsSync(reflectPath)) {
+    try {
+      const prev = JSON.parse(fs.readFileSync(reflectPath, "utf-8"));
+
+      // New format: { task_id, attempts: [...] }
+      if (prev && typeof prev === "object" && Array.isArray(prev.attempts)) {
+        payload = prev;
+      }
+      // Backward-compatible: old single-record format -> convert to attempts array
+      else if (
+        prev &&
+        typeof prev === "object" &&
+        ("attempt" in prev || "eval" in prev || "suggestion" in prev)
+      ) {
+        payload = { task_id: taskId, attempts: [prev] };
+      }
+    } catch {
+      // 旧文件损坏/非 JSON：直接重建，避免影响主流程
+      payload = { task_id: taskId, attempts: [] as any[] };
+    }
+  }
+
+  // 保底：避免旧/坏格式导致 attempts 不是 array
+  if (!payload || typeof payload !== "object") payload = { task_id: taskId, attempts: [] as any[] };
+  payload.task_id = payload.task_id ?? taskId;
+  if (!Array.isArray(payload.attempts)) payload.attempts = [];
+
+  payload.attempts.push({ ...record, ts: new Date().toISOString() });
+  fs.writeFileSync(reflectPath, JSON.stringify(payload, null, 2), "utf-8");
+}
+
+
 function resolveTasksPath(datasetFile?: string) {
     const file = datasetFile || DEFAULT_DATASET_FILE;
     return path.join(__dirname, "data", file);
@@ -67,6 +108,7 @@ interface RunOptions {
     resultsPath?: string;   // legacy override
     dataset_file?: string;
     results_dir?: string;
+    reflection?: boolean;
 }
 
 interface EvalOptions {
@@ -358,6 +400,192 @@ async function filterTasksByOptions(tasks: Task[], options: RunOptions): Promise
 }
 
 // evaluate one task
+type EvalResult = {
+    reasoning: string;
+    result: "SUCCESS" | "NOT SUCCESS";
+};
+
+type ReflectionSuggestion = {
+    failed_step: number; // -1 if unknown
+    failure_analysis: string;
+    improvement: string;
+};
+
+const REFLECTION_IMPROVEMENT_PROMPT = `
+You are a "reflection" assistant helping to improve the next attempt of a web-browsing agent.
+
+You will receive the SAME task instruction and the SAME trajectory (memory) as the evaluator.
+
+Your job:
+1) Briefly analyze why the attempt failed.
+2) Identify the likely step index where it first went wrong (0-based). If you cannot determine, use -1.
+3) Provide a short, actionable improvement message that will be fed directly to the policy LLM for the retry.
+
+Common failure patterns:
+- No final answer was produced (could be timeout or early exit).
+- A final answer was produced but the task was not actually completed correctly.
+- Wrong page / wrong field / wrong item clicked; got stuck in loops; login/captcha blockers.
+
+Keep the improvement message concise (<= 6 bullet points or <= 10 lines). Focus on concrete next actions and what to avoid repeating.
+`;
+
+async function createJudgeAgent(): Promise<Agent> {
+    const agent = new Agent({
+        llm: {
+            provider: "anthropic",
+            options: {
+                model: "claude-sonnet-4-5-20250929",
+                apiKey: process.env.ANTHROPIC_API_KEY,
+            },
+        },
+    });
+    await agent.start();
+    return agent;
+}
+
+async function evaluateOnce(
+    taskId: string,
+    resultsPath: string,
+    writeEvalFile: boolean,
+): Promise<EvalResult | null> {
+    const task = await findTaskById(TASKS_PATH, taskId);
+    if (!task) return null;
+
+    const memoryPath = path.join(resultsPath, `${task.id}.json`);
+    if (!fs.existsSync(memoryPath)) return null;
+
+    let raw: any = null;
+    try {
+        raw = JSON.parse(fs.readFileSync(memoryPath, "utf-8"));
+    } catch {
+        return null;
+    }
+
+    const memJson = raw?.memory;
+    if (!memJson || !Array.isArray(memJson.observations)) return null;
+
+    // evaluation agent for reflection
+    const agent = await createJudgeAgent();
+    await agent.memory.loadJSON(memJson);
+
+    const evalResult = await agent.query(
+        EVALUATION_PROMPT + "\n\n" + `TASK: ${task.ques}`,
+        z.object({
+            reasoning: z.string(),
+            result: z.enum(["SUCCESS", "NOT SUCCESS"]),
+        }),
+    );
+
+    if (writeEvalFile) {
+        const evalPath = path.join(resultsPath, `${task.id}.eval.json`);
+        fs.writeFileSync(evalPath, JSON.stringify(evalResult, null, 4));
+    }
+
+    return evalResult as EvalResult;
+}
+
+async function getReflectionSuggestion(
+    taskId: string,
+    resultsPath: string,
+    evalResult: EvalResult,
+): Promise<ReflectionSuggestion | null> {
+    const task = await findTaskById(TASKS_PATH, taskId);
+    if (!task) return null;
+
+    const memoryPath = path.join(resultsPath, `${task.id}.json`);
+    if (!fs.existsSync(memoryPath)) return null;
+
+    let raw: any = null;
+    try {
+        raw = JSON.parse(fs.readFileSync(memoryPath, "utf-8"));
+    } catch {
+        return null;
+    }
+
+    const memJson = raw?.memory;
+    if (!memJson || !Array.isArray(memJson.observations)) return null;
+
+    // Optional run metadata (may help reflection)
+    const actionCount = Number(raw?.actionCount ?? -1);
+    const timedOut = Boolean(raw?.timedOut);
+
+    // improvement agent for reflection
+    const agent = await createJudgeAgent();
+    await agent.memory.loadJSON(memJson);
+
+    const prompt =
+        REFLECTION_IMPROVEMENT_PROMPT +
+        "\n\n" +
+        `TASK: ${task.ques}` +
+        "\n\n" +
+        `Evaluator result: ${evalResult.result}` +
+        "\n" +
+        `Evaluator reasoning (for reference): ${evalResult.reasoning}` +
+        "\n\n" +
+        `Run meta: actionCount=${actionCount}, timedOut=${timedOut}`;
+
+    const suggestion = await agent.query(
+        prompt,
+        z.object({
+            failed_step: z.number().int(),
+            failure_analysis: z.string(),
+            improvement: z.string(),
+        }),
+    );
+
+    return suggestion as ReflectionSuggestion;
+}
+
+async function runTaskWithReflectionRetries(
+    task: Task,
+    resultsPath: string,
+    writeEvalFile: boolean,
+    maxAttempts: number,
+): Promise<{ success: boolean; attempts: number }> {
+    let reflectionHint: string | undefined = undefined;
+    let lastEval: EvalResult | null = null;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        console.log(
+            `\n[Reflection] Attempt ${attempt}/${maxAttempts} for task ${task.id}${reflectionHint ? " (with hint)" : ""}`,
+        );
+
+        // Run the task. (We pass runEval through; eval writing is controlled by evaluateOnce/writeEvalFile.)
+        await runTaskAsProcess(task, writeEvalFile, resultsPath, reflectionHint);
+
+        // Judge success using the same evaluator prompt/schema.
+        lastEval = await evaluateOnce(task.id, resultsPath, writeEvalFile);
+
+        if (!lastEval) {
+            console.warn(`[Reflection] Could not evaluate ${task.id} (missing/invalid memory).`);
+        }
+
+        const isSuccess = !!lastEval && lastEval.result === "SUCCESS";
+        const canRetry = attempt < maxAttempts;
+
+        // only get suggestion when this attempt does not succeed
+        let suggestion: any = null;
+        if (!isSuccess && canRetry && lastEval) {
+            suggestion = await getReflectionSuggestion(task.id, resultsPath, lastEval);
+
+            reflectionHint =
+                suggestion?.improvement ??
+                "The previous attempt failed. Make sure you complete the task end-to-end and ALWAYS call the answer action with the final result. If you get stuck, backtrack and try an alternative path.";
+        }
+
+        // ✅ Always persist reflection after each attempt (including the last attempt).
+        try {
+            appendReflectRecord(resultsPath, task.id, { attempt, eval: lastEval, suggestion });
+        } catch {}
+
+        if (isSuccess) {
+            return { success: true, attempts: attempt };
+        }
+    }
+
+    return { success: false, attempts: maxAttempts };
+}
+
 async function evalTask(taskId: string, resultsPath: string = "results/default") {
     const task = (await findTaskById(TASKS_PATH, taskId))!;
 
@@ -373,7 +601,7 @@ async function evalTask(taskId: string, resultsPath: string = "results/default")
         return;
     }
 
-
+    // evaluator agent
     const agent = new Agent({
         llm: {
             // provider: 'openai-generic',
@@ -408,20 +636,28 @@ async function evalTask(taskId: string, resultsPath: string = "results/default")
             result: z.enum(["SUCCESS", "NOT SUCCESS"]),
         }),
     );
+
     console.log(evalResult);
 
     const evalPath = path.join(resultsPath, `${task.id}.eval.json`);
     fs.writeFileSync(evalPath, JSON.stringify(evalResult, null, 4));
 }
 
-async function runTaskAsProcess(task: Task, runEval: boolean, resultsPath: string = "results/default"): Promise<boolean> {
+
+async function runTaskAsProcess(task: Task, runEval: boolean, resultsPath: string = "results/default", reflectionHint?: string): Promise<boolean> {
     return new Promise((resolve) => {
-        const child = spawn('bun', [
+        const args = [
             path.join(__dirname, 'wv-runner.ts'),
             JSON.stringify(task),
             String(runEval),
             resultsPath,
-        ], {
+        ];
+
+        if (reflectionHint && reflectionHint.trim().length > 0) {
+            args.push(JSON.stringify(reflectionHint));
+        }
+
+        const child = spawn('bun', args, {
             stdio: 'inherit',
             env: process.env,
         });
@@ -460,10 +696,19 @@ async function runTaskAsProcess(task: Task, runEval: boolean, resultsPath: strin
     });
 }
 
-async function runTasksParallel(tasks: Task[], workers: number, runEval: boolean = false, resultsPath: string = "results/default") {
+async function runTasksParallel(
+    tasks: Task[],
+    workers: number,
+    runEval: boolean = false,
+    resultsPath: string = "results/default",
+    useReflection: boolean = false,
+) {
     // Run tasks in parallel with worker processes
     let taskIndex = 0;
-    let completedTasks = 0;
+    let finishedTasks = 0;
+    let succeededTasks = 0;
+
+    const MAX_REFLECTION_ATTEMPTS = 3;
 
     const runWorker = async (workerId: number) => {
         while (taskIndex < tasks.length) {
@@ -474,18 +719,50 @@ async function runTasksParallel(tasks: Task[], workers: number, runEval: boolean
                 `\n[Worker ${workerId}] Starting task ${currentIndex + 1}/${tasks.length}: ${task.id}`,
             );
 
-            const success = await runTaskAsProcess(task, runEval, resultsPath);
+            if (useReflection) {
+                const { success, attempts } = await runTaskWithReflectionRetries(
+                    task,
+                    resultsPath,
+                    runEval,
+                    MAX_REFLECTION_ATTEMPTS,
+                );
 
-            if (success) {
-                completedTasks++;
-                console.log(
-                    `\n[Worker ${workerId}] Completed task ${currentIndex + 1}/${tasks.length}: ${task.id} (${completedTasks} total completed)`,
-                );
+                finishedTasks++;
+                if (success) succeededTasks++;
+
+                if (success) {
+                    console.log(
+                        `\n[Worker ${workerId}] SUCCESS after ${attempts} attempt(s): ${task.id} (${succeededTasks}/${finishedTasks} successful so far)`,
+                    );
+                } else {
+                    console.error(
+                        `\n[Worker ${workerId}] FAILED after ${attempts} attempt(s): ${task.id} (${succeededTasks}/${finishedTasks} successful so far)`,
+                    );
+                }
             } else {
-                completedTasks++;
-                console.error(
-                    `\n[Worker ${workerId}] Failed task ${currentIndex + 1}/${tasks.length}: ${task.id}`,
-                );
+                const processOk = await runTaskAsProcess(task, runEval, resultsPath);
+
+                finishedTasks++;
+                if (processOk) succeededTasks++;
+
+                if (processOk) {
+                    // (Optional) evaluate right after run
+                    if (runEval) {
+                        try {
+                            await evalTask(task.id, resultsPath);
+                        } catch (e) {
+                            console.error(`[Worker ${workerId}] Eval failed for ${task.id}:`, e);
+                        }
+                    }
+
+                    console.log(
+                        `\n[Worker ${workerId}] Completed task ${currentIndex + 1}/${tasks.length}: ${task.id} (${succeededTasks}/${finishedTasks} successful so far)`,
+                    );
+                } else {
+                    console.error(
+                        `\n[Worker ${workerId}] Process failed task ${currentIndex + 1}/${tasks.length}: ${task.id} (${succeededTasks}/${finishedTasks} successful so far)`,
+                    );
+                }
             }
         }
     };
@@ -497,7 +774,9 @@ async function runTasksParallel(tasks: Task[], workers: number, runEval: boolean
 
     await Promise.all(workerPromises);
 
-    console.log(`\nAttempted ${tasks.length} task${tasks.length !== 1 ? "s" : ""}`);
+    console.log(
+        `\nAttempted ${tasks.length} task${tasks.length !== 1 ? "s" : ""}. Success: ${succeededTasks}/${tasks.length}`,
+    );
 }
 
 async function evalTasksParallel(taskIds: string[], workers: number, resultsPath: string = "results/default") {
@@ -546,7 +825,8 @@ program
     .command("run [input]")
     .description("Run tasks by category or task ID")
     .option("-w, --workers <number>", "Number of parallel workers", "1")
-    .option("--eval", "Automatically run evaluation after each task")
+    .option("--eval", "Automatically run evaluation after each task") // never been used
+    .option("--reflection", "Enable reflection-based retries for failed tasks (max 3 total attempts, including the first try)")
     .option("--failed", "Include failed tasks (default: only incomplete tasks) - useful for pass@N")
     .option("--failed-only", "Only run failed tasks")
     .option("--replace", "Run all tasks regardless of status")
@@ -561,27 +841,25 @@ program
         const workers = parseInt(options.workers);
         let tasksToRun: Task[] = [];
 
-        if (input && isTaskId(input)) {
-            // Single task ID provided
+        if (input) {
+            // Prefer exact task-id match first (works for ids without "--", e.g. Online-Mind2Web)
             const task = await findTaskById(TASKS_PATH, input);
-            if (!task) {
-                console.error(`Task ${input} not found`);
-                return;
-            }
-            tasksToRun = [task];
-        } else if (input) {
-            // Category name provided
-            const categoryTasks = await getAllTasks(TASKS_PATH, input);
-            if (categoryTasks.length === 0) {
-                console.error(`No tasks found for category: ${input}`);
-                return;
-            }
+            if (task) {
+                tasksToRun = [task];
+            } else {
+                // Category name provided
+                const categoryTasks = await getAllTasks(TASKS_PATH, input);
+                if (categoryTasks.length === 0) {
+                    console.error(`No tasks found for category: ${input}`);
+                    return;
+                }
 
-            // Ask for task selection
-            const selectedTasks = await selectTasksFromCategory(input);
-            if (!selectedTasks) return;
+                // Ask for task selection
+                const selectedTasks = await selectTasksFromCategory(input);
+                if (!selectedTasks) return;
 
-            tasksToRun = await filterTasksByOptions(selectedTasks, options);
+                tasksToRun = await filterTasksByOptions(selectedTasks, options);
+            }
         } else {
             // No input - ask for categories
             const selectedCategories = await selectCategories();
@@ -615,7 +893,7 @@ program
 
         p.outro(`Running ${tasksToRun.length} task${tasksToRun.length !== 1 ? "s" : ""} with ${workers} worker${workers !== 1 ? "s" : ""}`);
 
-        await runTasksParallel(tasksToRun, workers, options.eval || false, resultsPath);
+        await runTasksParallel(tasksToRun, workers, options.eval || false, resultsPath, options.reflection || false);
     });
 
 program
@@ -634,22 +912,26 @@ program
         const workers = parseInt(options.workers);
         let taskIdsToEval: string[] = [];
 
-        if (input && isTaskId(input)) {
-            // Single task ID provided
-            taskIdsToEval = [input];
-        } else if (input) {
-            // Category name provided
-            const categoryTasks = await getAllTasks(TASKS_PATH, input);
-            if (categoryTasks.length === 0) {
-                console.error(`No tasks found for category: ${input}`);
-                return;
-            }
+        if (input) {
+            // Prefer exact task-id match first (works for ids without "--", e.g. Online-Mind2Web)
+            const task = await findTaskById(TASKS_PATH, input);
+            if (task) {
+                // Single task ID provided
+                taskIdsToEval = [input];
+            } else {
+                // Category name provided
+                const categoryTasks = await getAllTasks(TASKS_PATH, input);
+                if (categoryTasks.length === 0) {
+                    console.error(`No tasks found for category: ${input}`);
+                    return;
+                }
 
-            // Filter to tasks that have been run
-            for (const task of categoryTasks) {
-                const status = await getTaskStatus(task.id, resultsPath);
-                if (status.hasRun && (options.replace || !status.hasEval)) {
-                    taskIdsToEval.push(task.id);
+                // Filter to tasks that have been run
+                for (const task of categoryTasks) {
+                    const status = await getTaskStatus(task.id, resultsPath);
+                    if (status.hasRun && (options.replace || !status.hasEval)) {
+                        taskIdsToEval.push(task.id);
+                    }
                 }
             }
         } else {
