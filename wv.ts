@@ -573,10 +573,32 @@ async function runTaskWithReflectionRetries(
                 "The previous attempt failed. Make sure you complete the task end-to-end and ALWAYS call the answer action with the final result. If you get stuck, backtrack and try an alternative path.";
         }
 
-        // ✅ Always persist reflection after each attempt (including the last attempt).
-        try {
-            appendReflectRecord(resultsPath, task.id, { attempt, eval: lastEval, suggestion });
-        } catch {}
+        const reflectPath = path.join(resultsPath, `${task.id}.reflect.json`);
+
+        // ✅ Keep old behavior: even if attempt=1 succeeds, still write {attempts:[...]} into .reflect.json
+        const shouldPersistReflect = true || fs.existsSync(reflectPath) || !isSuccess;
+
+        if (shouldPersistReflect) {
+            let run: any = null;
+            try {
+                const runPath = path.join(resultsPath, `${task.id}.json`);
+                if (fs.existsSync(runPath)) {
+                    const raw = JSON.parse(fs.readFileSync(runPath, "utf-8"));
+                    run = {
+                        timeMs: Number(raw?.time ?? 0),
+                        actionCount: Number(raw?.actionCount ?? 0),
+                        inputTokens: Number(raw?.totalInputTokens ?? 0),
+                        outputTokens: Number(raw?.totalOutputTokens ?? 0),
+                        timedOut: Boolean(raw?.timedOut ?? false),
+                        error: raw?.error ?? null,
+                    };
+                }
+            } catch {}
+
+            try {
+                appendReflectRecord(resultsPath, task.id, { attempt, eval: lastEval, suggestion, run });
+            } catch {}
+        }
 
         if (isSuccess) {
             return { success: true, attempts: attempt };
@@ -1073,6 +1095,10 @@ async function showStats(
         timeMs?: number;
         inputTokens?: number;
         outputTokens?: number;
+        totalActions?: number;
+        totalTimeMs?: number;
+        totalInputTokens?: number;
+        totalOutputTokens?: number;
       }>;
     }
   >();
@@ -1082,6 +1108,18 @@ async function showStats(
   const allTimesMs: number[] = [];
   const allInputTokens: number[] = [];
   const allOutputTokens: number[] = [];
+
+  // overall arrays (total w/ retries, from .reflect.json when available)
+  const allActionCountsTotal: number[] = [];
+  const allTimesMsTotal: number[] = [];
+  const allInputTokensTotal: number[] = [];
+  const allOutputTokensTotal: number[] = [];
+
+  // attempt count
+  const allAttempts: number[] = [];
+  let tasksWithReflect = 0;
+  let totalAttempts = 0;
+
 
   // task speed rows (only from id.json)
   const taskSpeedRows: Array<{ taskId: string; actions: number; timeMs: number }> = [];
@@ -1099,14 +1137,54 @@ async function showStats(
   // Tracked info (NOT part of default unfinished)
   let timedOutTasks = 0;
 
+  let firstTrySuccessTasks = 0;
+
   for (const evalFile of evalFiles) {
     const taskId = evalFile.replace(".eval.json", "");
     const evalPath = path.join(resultsDir, evalFile);
     const runPath = path.join(resultsDir, `${taskId}.json`);
 
+    const reflectPath = path.join(resultsDir, `${taskId}.reflect.json`);
+
+    let reflectData: any = null;
+    let reflectAttempts: any[] = [];
+
+    let attemptCount = 1;
+    if (fs.existsSync(reflectPath)) {
+        tasksWithReflect += 1;
+        try {
+            reflectData = JSON.parse(fs.readFileSync(reflectPath, "utf-8"));
+
+            // 兼容两种格式：
+            // 1) { attempts: [...] }
+            // 2) 单条记录对象（旧格式） -> 当成 1 attempt
+            reflectAttempts = Array.isArray(reflectData?.attempts)
+            ? reflectData.attempts
+            : reflectData && typeof reflectData === "object"
+                ? [reflectData]
+                : [];
+
+            // 新格式按 attempts.length（但兜底至少 1）
+            attemptCount = Array.isArray(reflectData?.attempts)
+            ? (reflectAttempts.length || 1)
+            : 1;
+        } catch {
+            reflectData = null;
+            reflectAttempts = [];
+            attemptCount = 1;
+        }
+    }
+
+    allAttempts.push(attemptCount);
+    totalAttempts += attemptCount;
+
     try {
       const evalData = JSON.parse(fs.readFileSync(evalPath, "utf-8"));
       const isSuccess = evalData.result === "SUCCESS";
+
+      if (isSuccess && attemptCount === 1) {
+        firstTrySuccessTasks += 1;
+      }
 
       const category = taskId.includes("--")
         ? taskId.split("--")[0]!
@@ -1154,6 +1232,38 @@ async function showStats(
         const taskInTokens = Number(runData.totalInputTokens ?? 0);
         const taskOutTokens = Number(runData.totalOutputTokens ?? 0);
 
+        let totalTaskActions = taskActions;
+        let totalTaskTimeMs = taskTimeMs;
+        let totalTaskInTokens = taskInTokens;
+        let totalTaskOutTokens = taskOutTokens;
+
+        try {
+            if (reflectAttempts.length > 0) {
+                let sumA = 0;
+                let sumT = 0;
+                let sumIn = 0;
+                let sumOut = 0;
+                let hasAny = false;
+
+                for (const a of reflectAttempts) {
+                    const run = a?.run;
+                    if (!run) continue;
+
+                    sumT += Number(run?.timeMs ?? 0);
+                    sumA += Number(run?.actionCount ?? 0);
+                    sumIn += Number(run?.inputTokens ?? 0);
+                    sumOut += Number(run?.outputTokens ?? 0);
+                    hasAny = true;
+                }
+
+                if (hasAny) {
+                    totalTaskActions = sumA;
+                    totalTaskTimeMs = sumT;
+                    totalTaskInTokens = sumIn;
+                    totalTaskOutTokens = sumOut;
+                }
+            }
+        } catch {}
 
         // ===== timed out 作为信息项单独统计 =====
         if (sig.hasTimedOut) {
@@ -1191,6 +1301,11 @@ async function showStats(
         allInputTokens.push(taskInTokens);
         allOutputTokens.push(taskOutTokens);
 
+        allActionCountsTotal.push(totalTaskActions);
+        allTimesMsTotal.push(totalTaskTimeMs);
+        allInputTokensTotal.push(totalTaskInTokens);
+        allOutputTokensTotal.push(totalTaskOutTokens);
+
         // For task_speed.txt (written by stats)
         taskSpeedRows.push({ taskId, actions: taskActions, timeMs: taskTimeMs });
 
@@ -1202,6 +1317,10 @@ async function showStats(
             timeMs: taskTimeMs,
             inputTokens: taskInTokens,
             outputTokens: taskOutTokens,
+            totalActions: totalTaskActions,
+            totalTimeMs: totalTaskTimeMs,
+            totalInputTokens: totalTaskInTokens,
+            totalOutputTokens: totalTaskOutTokens,
             });
         }
     } else {
@@ -1250,12 +1369,35 @@ async function showStats(
           console.log(`  ${status} ${task.taskId.padEnd(20)} | (no run json)`);
         } else {
           const timeMin = ((task.timeMs ?? 0) / 1000 / 60).toFixed(1);
+          const timeMinTotal = ((task.totalTimeMs ?? task.timeMs ?? 0) / 1000 / 60).toFixed(1);
+
+          const actionsTotal = task.totalActions ?? task.actions;
+          const inTokTotal = task.totalInputTokens ?? task.inputTokens ?? 0;
+          const outTokTotal = task.totalOutputTokens ?? task.outputTokens ?? 0;
+
+          const hasTotal =
+            task.totalTimeMs != null &&
+            (task.totalTimeMs !== task.timeMs ||
+              task.totalActions !== task.actions ||
+              task.totalInputTokens !== task.inputTokens ||
+              task.totalOutputTokens !== task.outputTokens);
+
           console.log(
-            `  ${status} ${task.taskId.padEnd(20)} | Actions: ${task.actions
-              .toString()
-              .padStart(3)} | Time: ${timeMin.padStart(5)} min | InTok: ${(task.inputTokens ?? 0)
-              .toString()
-              .padStart(6)} | OutTok: ${(task.outputTokens ?? 0).toString().padStart(6)}`,
+            hasTotal
+              ? `  ${status} ${task.taskId.padEnd(20)} | Actions: ${task.actions
+                  .toString()
+                  .padStart(3)} (tot ${actionsTotal!.toString().padStart(3)}) | Time: ${timeMin.padStart(
+                  5,
+                )} (tot ${timeMinTotal.padStart(5)}) min | InTok: ${(task.inputTokens ?? 0)
+                  .toString()
+                  .padStart(6)} (tot ${inTokTotal.toString().padStart(6)}) | OutTok: ${(task.outputTokens ?? 0)
+                  .toString()
+                  .padStart(6)} (tot ${outTokTotal.toString().padStart(6)})`
+              : `  ${status} ${task.taskId.padEnd(20)} | Actions: ${task.actions
+                  .toString()
+                  .padStart(3)} | Time: ${timeMin.padStart(5)} min | InTok: ${(task.inputTokens ?? 0)
+                  .toString()
+                  .padStart(6)} | OutTok: ${(task.outputTokens ?? 0).toString().padStart(6)}`,
           );
         }
       }
@@ -1321,6 +1463,15 @@ async function showStats(
   const inTokStats = summarize(allInputTokens);
   const outTokStats = summarize(allOutputTokens);
 
+  const timeMinutesTotal = allTimesMsTotal.map((ms) => ms / 1000 / 60);
+
+  const timeStatsTotal = summarize(timeMinutesTotal);
+  const actionStatsTotal = summarize(allActionCountsTotal);
+  const inTokStatsTotal = summarize(allInputTokensTotal);
+  const outTokStatsTotal = summarize(allOutputTokensTotal);
+
+  const attemptStats = summarize(allAttempts);
+
   console.log("\n=== Overall Task Metric Statistics ===\n");
   // totalTasks: tasks with eval.json
   console.log(`Evaluated tasks (tasks with eval json): ${totalTasks}\n`);
@@ -1339,6 +1490,13 @@ async function showStats(
   
   console.log(`Timed out tasks: ${timedOutTasks}/${totalTasks}\n`);
 
+  //console.log(`Tasks with reflect json: ${tasksWithReflect}/${totalTasks}`);
+  console.log(`First-try successes: ${firstTrySuccessTasks}/${totalTasks}`);
+  console.log(`Total attempts (incl. retries): ${totalAttempts}`);
+  console.log(`Extra retries: ${Math.max(0, totalAttempts - totalTasks)}`);
+  console.log(`Avg attempts per task: ${(totalAttempts / totalTasks).toFixed(2)}\n`);
+
+  console.log("=== Task Metric Statistics (Final attempt) ===");
   console.log("Metric                |   Min   |   Max   |   Mean  |  Median");
   console.log("----------------------|---------|---------|---------|---------");
   console.log(
@@ -1369,6 +1527,47 @@ async function showStats(
       .toFixed(1)
       .padStart(7)}`,
   );
+
+  console.log("\n")
+  console.log("=== Task Metric Statistics (Total w/ retries) ===");
+  console.log("Metric                |   Min   |   Max   |   Mean  |  Median");
+  console.log("----------------------|---------|---------|---------|---------");
+  console.log(
+    `Time (min)            | ${timeStatsTotal.min.toFixed(1).padStart(7)} | ${timeStatsTotal.max
+      .toFixed(1)
+      .padStart(7)} | ${timeStatsTotal.mean.toFixed(1).padStart(7)} | ${timeStatsTotal.median
+      .toFixed(1)
+      .padStart(7)}`,
+  );
+  console.log(
+    `Action count          | ${actionStatsTotal.min.toFixed(1).padStart(7)} | ${actionStatsTotal.max
+      .toFixed(1)
+      .padStart(7)} | ${actionStatsTotal.mean.toFixed(1).padStart(7)} | ${actionStatsTotal.median
+      .toFixed(1)
+      .padStart(7)}`,
+  );
+  console.log(
+    `Total input tokens    | ${inTokStatsTotal.min.toFixed(1).padStart(7)} | ${inTokStatsTotal.max
+      .toFixed(1)
+      .padStart(7)} | ${inTokStatsTotal.mean.toFixed(1).padStart(7)} | ${inTokStatsTotal.median
+      .toFixed(1)
+      .padStart(7)}`,
+  );
+  console.log(
+    `Total output tokens   | ${outTokStatsTotal.min.toFixed(1).padStart(7)} | ${outTokStatsTotal.max
+      .toFixed(1)
+      .padStart(7)} | ${outTokStatsTotal.mean.toFixed(1).padStart(7)} | ${outTokStatsTotal.median
+      .toFixed(1)
+      .padStart(7)}`,
+  );
+  console.log(
+    `Attempts              | ${attemptStats.min.toFixed(1).padStart(7)} | ${attemptStats.max
+        .toFixed(1)
+        .padStart(7)} | ${attemptStats.mean.toFixed(1).padStart(7)} | ${attemptStats.median
+        .toFixed(1)
+        .padStart(7)}`,
+  );
+
 
   // ===== Write per-task speed file =====
   if (taskSpeedRows.length > 0) {

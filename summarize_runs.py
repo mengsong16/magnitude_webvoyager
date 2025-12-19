@@ -109,15 +109,91 @@ def _extract_success(evalj: Dict[str, Any]) -> Optional[bool]:
     return None
 
 
+def _extract_total_from_reflect(reflectj: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Return (time_ms, action_count, input_tokens, output_tokens) summed across attempts.
+    Expected reflect format (new):
+      { "task_id": "...", "attempts": [ { "run": { "timeMs":..., "actionCount":..., "inputTokens":..., "outputTokens":... } }, ... ] }
+    Backward compatible:
+      - If no "attempts" list, treat reflectj itself as one attempt record.
+    If no usable per-attempt run stats exist, returns (None, None, None, None).
+    """
+    attempts: List[Any] = []
+    if isinstance(reflectj.get("attempts"), list):
+        attempts = reflectj.get("attempts")  # type: ignore
+    else:
+        # old single-record format
+        attempts = [reflectj]
+
+    sum_time = 0.0
+    sum_actions = 0.0
+    sum_inp = 0.0
+    sum_out = 0.0
+    has_any = False
+
+    for a in attempts:
+        if not isinstance(a, dict):
+            continue
+        run = a.get("run")
+        if not isinstance(run, dict):
+            continue
+
+        t = _to_float(_get_first(run, ["timeMs", "time_ms", "time"]))
+        ac = _to_float(_get_first(run, ["actionCount", "action_count", "actions"]))
+        inp = _to_float(_get_first(run, ["inputTokens", "totalInputTokens", "total_input_tokens"]))
+        out = _to_float(_get_first(run, ["outputTokens", "totalOutputTokens", "total_output_tokens"]))
+
+        if t is not None:
+            sum_time += t
+            has_any = True
+        if ac is not None:
+            sum_actions += ac
+            has_any = True
+        if inp is not None:
+            sum_inp += inp
+            has_any = True
+        if out is not None:
+            sum_out += out
+            has_any = True
+
+    if not has_any:
+        return None, None, None, None
+
+    return sum_time, sum_actions, sum_inp, sum_out
+
+
+def _extract_attempts_count_from_reflect(reflectj: Dict[str, Any]) -> Optional[float]:
+    """Return number of attempts recorded in <task_id>.reflect.json.
+    Expected new format: {"attempts": [...] } -> len(attempts)
+    Backward compatible: old single-record format -> 1
+    Returns None if reflectj is not usable.
+    """
+    if not isinstance(reflectj, dict):
+        return None
+    atts = reflectj.get("attempts")
+    if isinstance(atts, list):
+        return float(len(atts))
+    # old single-record format (has attempt/eval/suggestion at top-level)
+    if any(k in reflectj for k in ["attempt", "eval", "suggestion", "run", "ts"]):
+        return 1.0
+    return None
+
 @dataclass
 class RunSummary:
     run_dir: str
     n_tasks: int
     success_rate: float
+    # Attempts per task (from <task_id>.reflect.json if present; otherwise assume 1)
+    attempts_stats: Dict[str, float]
+    # Final attempt metrics (from <task_id>.json)
     time_min_stats: Dict[str, float]
     action_stats: Dict[str, float]
     in_tok_stats: Dict[str, float]
     out_tok_stats: Dict[str, float]
+    # Total metrics with retries (from <task_id>.reflect.json attempts[].run), fallback to final if missing
+    time_min_total_stats: Dict[str, float]
+    action_total_stats: Dict[str, float]
+    in_tok_total_stats: Dict[str, float]
+    out_tok_total_stats: Dict[str, float]
 
 
 def _stats(arr: List[float]) -> Dict[str, float]:
@@ -141,7 +217,7 @@ def summarize_one_run(results_dir: str) -> RunSummary:
     # run jsons: exclude *.eval.json
     run_json_paths = sorted([
         p for p in glob.glob(os.path.join(results_dir, "*.json"))
-        if not p.endswith(".eval.json")
+        if (not p.endswith(".eval.json")) and (not p.endswith(".reflect.json"))
     ])
 
     # map task_id -> run json
@@ -150,6 +226,15 @@ def summarize_one_run(results_dir: str) -> RunSummary:
     action_list: List[float] = []
     in_tok_list: List[float] = []
     out_tok_list: List[float] = []
+
+    # attempts per task (from .reflect.json if present; otherwise assume 1)
+    attempts_list: List[float] = []
+
+    # total metrics with retries (sum attempts from .reflect.json if available)
+    time_min_total_list: List[float] = []
+    action_total_list: List[float] = []
+    in_tok_total_list: List[float] = []
+    out_tok_total_list: List[float] = []
 
     for p in run_json_paths:
         task_id = os.path.splitext(os.path.basename(p))[0]
@@ -176,6 +261,42 @@ def summarize_one_run(results_dir: str) -> RunSummary:
         if out is not None:
             out_tok_list.append(float(out))
 
+
+        # total metrics with retries: prefer .reflect.json attempts[].run sums; fallback to final attempt values
+        t_total_ms: Optional[float] = None
+        a_total: Optional[float] = None
+        inp_total: Optional[float] = None
+        out_total: Optional[float] = None
+
+        attempts_n: Optional[float] = 1.0
+        reflect_p = os.path.join(results_dir, f"{task_id}.reflect.json")
+        if os.path.exists(reflect_p):
+            rfj = _read_json(reflect_p)
+            if isinstance(rfj, dict):
+                t_total_ms, a_total, inp_total, out_total = _extract_total_from_reflect(rfj)
+                attempts_n = _extract_attempts_count_from_reflect(rfj) or attempts_n
+
+
+        if t_total_ms is None:
+            t_total_ms = t_ms
+        if a_total is None:
+            a_total = a
+        if inp_total is None:
+            inp_total = inp
+        if out_total is None:
+            out_total = out
+
+        if t_total_ms is not None:
+            time_min_total_list.append(float(t_total_ms) / 1000.0 / 60.0)
+        if a_total is not None:
+            action_total_list.append(float(a_total))
+        if inp_total is not None:
+            in_tok_total_list.append(float(inp_total))
+        if out_total is not None:
+            out_tok_total_list.append(float(out_total))
+
+        if attempts_n is not None:
+            attempts_list.append(float(attempts_n))
     # success rate from eval jsons (match wv.ts: evalData.result === "SUCCESS")
     eval_paths = sorted(glob.glob(os.path.join(results_dir, "*.eval.json")))
     total_for_sr = len(eval_paths) if len(eval_paths) > 0 else len(task_ids)
@@ -199,10 +320,15 @@ def summarize_one_run(results_dir: str) -> RunSummary:
         run_dir=results_dir,
         n_tasks=len(task_ids),
         success_rate=success_rate,
+        attempts_stats=safe_stats(attempts_list),
         time_min_stats=safe_stats(time_min_list),
         action_stats=safe_stats(action_list),
         in_tok_stats=safe_stats(in_tok_list),
         out_tok_stats=safe_stats(out_tok_list),
+        time_min_total_stats=safe_stats(time_min_total_list),
+        action_total_stats=safe_stats(action_total_list),
+        in_tok_total_stats=safe_stats(in_tok_total_list),
+        out_tok_total_stats=safe_stats(out_tok_total_list),
     )
 
 
@@ -226,10 +352,18 @@ def summarize_runs(run_dirs: List[str], base_results_dir: Optional[str] = None) 
         print(f"Overall success rate: {sr:.4f}" if not math.isnan(sr) else "Overall success rate: NaN (no eval json parsed)")
         print("Metric                |   Min   |   Max   |   Mean  |  Median")
         print("----------------------|---------|---------|---------|---------")
+        print(f"Attempts             | {s.attempts_stats['min']:.1f} | {s.attempts_stats['max']:.1f} | {s.attempts_stats['mean']:.2f} | {s.attempts_stats['median']:.1f}")
         print(f"Time (min)            | {s.time_min_stats['min']:.1f} | {s.time_min_stats['max']:.1f} | {s.time_min_stats['mean']:.1f} | {s.time_min_stats['median']:.1f}")
         print(f"Action count          | {s.action_stats['min']:.1f} | {s.action_stats['max']:.1f} | {s.action_stats['mean']:.1f} | {s.action_stats['median']:.1f}")
         print(f"Total input tokens    | {s.in_tok_stats['min']:.1f} | {s.in_tok_stats['max']:.1f} | {s.in_tok_stats['mean']:.1f} | {s.in_tok_stats['median']:.1f}")
         print(f"Total output tokens   | {s.out_tok_stats['min']:.1f} | {s.out_tok_stats['max']:.1f} | {s.out_tok_stats['mean']:.1f} | {s.out_tok_stats['median']:.1f}")
+        print("\n[Total w/ retries]")
+        print("Metric                |   Min   |   Max   |   Mean  |  Median")
+        print("----------------------|---------|---------|---------|---------")
+        print(f"Time (min)            | {s.time_min_total_stats['min']:.1f} | {s.time_min_total_stats['max']:.1f} | {s.time_min_total_stats['mean']:.1f} | {s.time_min_total_stats['median']:.1f}")
+        print(f"Action count          | {s.action_total_stats['min']:.1f} | {s.action_total_stats['max']:.1f} | {s.action_total_stats['mean']:.1f} | {s.action_total_stats['median']:.1f}")
+        print(f"Total input tokens    | {s.in_tok_total_stats['min']:.1f} | {s.in_tok_total_stats['max']:.1f} | {s.in_tok_total_stats['mean']:.1f} | {s.in_tok_total_stats['median']:.1f}")
+        print(f"Total output tokens   | {s.out_tok_total_stats['min']:.1f} | {s.out_tok_total_stats['max']:.1f} | {s.out_tok_total_stats['mean']:.1f} | {s.out_tok_total_stats['median']:.1f}")
 
     # across-runs mean ± std (using per-run MEANs, and success_rate)
     def mean_std(values: List[float]) -> Tuple[float, float]:
@@ -241,10 +375,19 @@ def summarize_runs(run_dirs: List[str], base_results_dir: Optional[str] = None) 
         return float(np.mean(vals)), float(np.std(vals, ddof=1))
 
     sr_m, sr_s = mean_std([s.success_rate for s in summaries])
+    att_m, att_s = mean_std([s.attempts_stats["mean"] for s in summaries])
     t_m, t_s = mean_std([s.time_min_stats["mean"] for s in summaries])
     a_m, a_s = mean_std([s.action_stats["mean"] for s in summaries])
     in_m, in_s = mean_std([s.in_tok_stats["mean"] for s in summaries])
     out_m, out_s = mean_std([s.out_tok_stats["mean"] for s in summaries])
+
+    # Total w/ retries: across-runs mean ± std of per-run MEANs
+    t_tot_m, t_tot_s = mean_std([s.time_min_total_stats["mean"] for s in summaries])
+    a_tot_m, a_tot_s = mean_std([s.action_total_stats["mean"] for s in summaries])
+    in_tot_m, in_tot_s = mean_std([s.in_tok_total_stats["mean"] for s in summaries])
+    out_tot_m, out_tot_s = mean_std([s.out_tok_total_stats["mean"] for s in summaries])
+
+    att_med_m, att_med_s = mean_std([s.attempts_stats["median"] for s in summaries])
 
     # NEW: across-runs mean ± std of per-run MEDIANs
     t_med_m, t_med_s = mean_std([s.time_min_stats["median"] for s in summaries])
@@ -252,9 +395,18 @@ def summarize_runs(run_dirs: List[str], base_results_dir: Optional[str] = None) 
     in_med_m, in_med_s = mean_std([s.in_tok_stats["median"] for s in summaries])
     out_med_m, out_med_s = mean_std([s.out_tok_stats["median"] for s in summaries])
 
+    # Total w/ retries: across-runs mean ± std of per-run MEDIANs
+    t_tot_med_m, t_tot_med_s = mean_std([s.time_min_total_stats["median"] for s in summaries])
+    a_tot_med_m, a_tot_med_s = mean_std([s.action_total_stats["median"] for s in summaries])
+    in_tot_med_m, in_tot_med_s = mean_std([s.in_tok_total_stats["median"] for s in summaries])
+    out_tot_med_m, out_tot_med_s = mean_std([s.out_tok_total_stats["median"] for s in summaries])
+
     print("\n===== Across-runs (mean ± std over runs) =====")
     print("----------------------------------------------")
     print(f"Success rate        : {sr_m:.4f} ± {sr_s:.4f}")
+    print("----------------------------------------------")
+    print(f"Attempts mean       : {att_m:.3f} ± {att_s:.3f}")
+    print(f"Attempts median     : {att_med_m:.3f} ± {att_med_s:.3f}")
     print("----------------------------------------------")
 
     print(f"Time mean (min)     : {t_m:.3f} ± {t_s:.3f}")
@@ -268,6 +420,17 @@ def summarize_runs(run_dirs: List[str], base_results_dir: Optional[str] = None) 
     print(f"Action median       : {a_med_m:.3f} ± {a_med_s:.3f}")
     print(f"Input tokens median : {in_med_m:.3f} ± {in_med_s:.3f}")
     print(f"Output tokens median: {out_med_m:.3f} ± {out_med_s:.3f}")
+    print("----------------------------------------------")
+    print("[Total w/ retries]")
+    print(f"Time mean (min)     : {t_tot_m:.3f} ± {t_tot_s:.3f}")
+    print(f"Action mean         : {a_tot_m:.3f} ± {a_tot_s:.3f}")
+    print(f"Input tokens mean   : {in_tot_m:.3f} ± {in_tot_s:.3f}")
+    print(f"Output tokens mean  : {out_tot_m:.3f} ± {out_tot_s:.3f}")
+    print("----------------------------------------------")
+    print(f"Time median (min)   : {t_tot_med_m:.3f} ± {t_tot_med_s:.3f}")
+    print(f"Action median       : {a_tot_med_m:.3f} ± {a_tot_med_s:.3f}")
+    print(f"Input tokens median : {in_tot_med_m:.3f} ± {in_tot_med_s:.3f}")
+    print(f"Output tokens median: {out_tot_med_m:.3f} ± {out_tot_med_s:.3f}")
 
     return summaries
 
