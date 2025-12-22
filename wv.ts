@@ -422,9 +422,10 @@ Your job:
 3) Provide a short, actionable improvement message that will be fed directly to the policy LLM for the retry.
 
 Common failure patterns:
-- No final answer was produced (could be timeout or early exit).
+- No final answer was produced (could be timeout, the agent deciding it cannot complete the task, or stopping before submitting the final answer).
 - A final answer was produced but the task was not actually completed correctly.
 - Wrong page / wrong field / wrong item clicked; got stuck in loops; login/captcha blockers.
+- The task instruction includes multiple requirements, but only a subset was satisfied.
 
 Keep the improvement message concise (<= 6 bullet points or <= 10 lines). Focus on concrete next actions and what to avoid repeating.
 `;
@@ -1119,6 +1120,7 @@ async function showStats(
   const allAttempts: number[] = [];
   let tasksWithReflect = 0;
   let totalAttempts = 0;
+  let totalRetries = 0;
 
 
   // task speed rows (only from id.json)
@@ -1138,6 +1140,7 @@ async function showStats(
   let timedOutTasks = 0;
 
   let firstTrySuccessTasks = 0;
+  let retrySuccessTasks = 0;
 
   for (const evalFile of evalFiles) {
     const taskId = evalFile.replace(".eval.json", "");
@@ -1177,6 +1180,7 @@ async function showStats(
 
     allAttempts.push(attemptCount);
     totalAttempts += attemptCount;
+    totalRetries += Math.max(0, attemptCount - 1);
 
     try {
       const evalData = JSON.parse(fs.readFileSync(evalPath, "utf-8"));
@@ -1184,6 +1188,10 @@ async function showStats(
 
       if (isSuccess && attemptCount === 1) {
         firstTrySuccessTasks += 1;
+      }
+
+      if (isSuccess && attemptCount > 1) {
+        retrySuccessTasks += 1;
       }
 
       const category = taskId.includes("--")
@@ -1492,8 +1500,10 @@ async function showStats(
 
   //console.log(`Tasks with reflect json: ${tasksWithReflect}/${totalTasks}`);
   console.log(`First-try successes: ${firstTrySuccessTasks}/${totalTasks}`);
+  console.log(`Retry successes: ${retrySuccessTasks}/${totalTasks}`);
   console.log(`Total attempts (incl. retries): ${totalAttempts}`);
-  console.log(`Extra retries: ${Math.max(0, totalAttempts - totalTasks)}`);
+  console.log(`Total retries: ${totalRetries}`);
+  //console.log(`Extra retries: ${Math.max(0, totalAttempts - totalTasks)}`);
   console.log(`Avg attempts per task: ${(totalAttempts / totalTasks).toFixed(2)}\n`);
 
   console.log("=== Task Metric Statistics (Final attempt) ===");
