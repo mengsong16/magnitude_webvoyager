@@ -4,9 +4,9 @@ set -euo pipefail
 BASE_RESULTS_DIR="results"
 
 RUN_DIRS=(
-  "online_mind2web_mini_30_4_worker_reflection_run4"
-  "online_mind2web_mini_30_4_worker_reflection_run5"
-  "online_mind2web_mini_30_4_worker_reflection_run6"
+  "webvoyager_mini_30_4_worker_reflection_run4"
+  "webvoyager_mini_30_4_worker_reflection_run5"
+  "webvoyager_mini_30_4_worker_reflection_run6"
 )
 
 # ----- compute common part (longest common prefix) of RUN_DIRS -----

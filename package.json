@@ -7,6 +7,7 @@
     "upload": "bun run upload-to-blob.ts"
   },
   "dependencies": {
+    "@anthropic-ai/vertex-sdk": "^0.14.0",
     "@clack/prompts": "^0.11.0",
     "@vercel/blob": "^1.1.1",
     "commander": "^14.0.1",

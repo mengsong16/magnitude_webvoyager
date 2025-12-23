@@ -422,13 +422,33 @@ Your job:
 3) Provide a short, actionable improvement message that will be fed directly to the policy LLM for the retry.
 
 Common failure patterns:
-- No final answer was produced (could be timeout, the agent deciding it cannot complete the task, or stopping before submitting the final answer).
+- No final answer was produced (could be timeout or early exit).
 - A final answer was produced but the task was not actually completed correctly.
 - Wrong page / wrong field / wrong item clicked; got stuck in loops; login/captcha blockers.
-- The task instruction includes multiple requirements, but only a subset was satisfied.
 
 Keep the improvement message concise (<= 6 bullet points or <= 10 lines). Focus on concrete next actions and what to avoid repeating.
 `;
+
+// const REFLECTION_IMPROVEMENT_PROMPT = `
+// You are a "reflection" assistant helping to improve the next attempt of a web-browsing agent.
+
+// You will receive the SAME task instruction and the SAME trajectory (memory) as the evaluator.
+
+// Your job:
+// 1) Briefly analyze why the attempt failed.
+// 2) Identify the likely step index where it first went wrong (0-based). If you cannot determine, use -1.
+// 3) Provide a short, actionable improvement message that will be fed directly to the policy LLM for the retry.
+
+// Common failure patterns:
+// - No final answer was produced (could be timeout, the agent deciding it cannot complete the task, or stopping before submitting the final answer).
+// - A final answer was produced but the task was not actually completed correctly.
+// - Wrong page / wrong field / wrong item clicked; got stuck in loops; login/captcha blockers.
+// - The task instruction includes multiple requirements, but only a subset was satisfied.
+
+// Keep the improvement message concise (<= 6 bullet points or <= 10 lines). Focus on concrete next actions and what to avoid repeating.
+// `;
+
+
 
 async function createJudgeAgent(): Promise<Agent> {
     const agent = new Agent({
@@ -1500,7 +1520,7 @@ async function showStats(
 
   //console.log(`Tasks with reflect json: ${tasksWithReflect}/${totalTasks}`);
   console.log(`First-try successes: ${firstTrySuccessTasks}/${totalTasks}`);
-  console.log(`Retry successes: ${retrySuccessTasks}/${totalTasks}`);
+  console.log(`Retry successes: ${retrySuccessTasks}/${totalTasks-firstTrySuccessTasks}`);
   console.log(`Total attempts (incl. retries): ${totalAttempts}`);
   console.log(`Total retries: ${totalRetries}`);
   //console.log(`Extra retries: ${Math.max(0, totalAttempts - totalTasks)}`);
