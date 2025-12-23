@@ -36,3 +36,8 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # Vercel
 .vercel
 .env*.local
+
+# __pycache__
+__pycache__/
+**/__pycache__/
+
