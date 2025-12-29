@@ -53,6 +53,12 @@ async function main() {
         : task.ques;
 
     const MAX_CRASH_RETRIES = 3;
+
+    // Task-level timeout budget (shared across crash retries)
+    const TIMEOUT_MIN = 20;
+    const TIMEOUT_MS = TIMEOUT_MIN * 60 * 1000;
+    const ATTEMPT_DEADLINE = Date.now() + TIMEOUT_MS;
+
     
     
     let crashAttempts = 0;
@@ -248,9 +254,11 @@ async function main() {
                 );
             });
 
-            // Set up timeout
-            const TIMEOUT_MIN = 20;
-            const TIMEOUT_MS = TIMEOUT_MIN * 60 * 1000;
+            // Set up timeout (shared across crash retries via ATTEMPT_DEADLINE)
+            const remainingMs = ATTEMPT_DEADLINE - Date.now();
+            if (remainingMs <= 0) {
+                throw new Error(`Task timed out after ${TIMEOUT_MIN} minutes`);
+            }
 
             let timer: NodeJS.Timeout | null = null;
 
@@ -258,9 +266,9 @@ async function main() {
                 await Promise.race([
                     agent.act(fullInstruction),
                     new Promise<void>((_, reject) => {
-                    timer = setTimeout(() => {
-                        reject(new Error(`Task timed out after ${TIMEOUT_MIN} minutes`));
-                    }, TIMEOUT_MS);
+                        timer = setTimeout(() => {
+                            reject(new Error(`Task timed out after ${TIMEOUT_MIN} minutes`));
+                        }, remainingMs);
                     }),
                 ]);
             } finally {
