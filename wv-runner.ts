@@ -23,7 +23,15 @@ async function main() {
     const taskJson = process.argv[2];
     const runEval = process.argv[3] === 'true'; // never been used
     const resultsPath = process.argv[4] || 'results/default';
-    const reflectionHintArg = process.argv[5];
+
+    // Args:
+    //   argv[5] = policyModel (string)
+    //   argv[6] = reflectionHint (string | JSON string)
+    const policyModel = process.argv[5] || 'claude-sonnet-4-5-20250929';
+    const reflectionHintArg = process.argv[6];
+
+
+    console.log(`[Runner] Using policy model: ${policyModel}`);
     let reflectionHint: string | null = null;
     if (reflectionHintArg) {
         try {
@@ -134,6 +142,17 @@ async function main() {
                 year: 'numeric'
             });
 
+            const BASE_POLICY_PROMPT = `Be careful to satisfy the task criteria precisely. If sequences of actions are failing, go one action at at time.\nConsider that today is ${formattedDate}.\n\nFor scrolling: positive deltaY values scroll DOWN (to see content below), negative deltaY values scroll UP (to see content above).`;
+
+            const OPENROUTER_FORMAT_PREFIX = `IMPORTANT OUTPUT FORMAT:
+                - You MUST output exactly ONE valid JSON object and nothing else (no markdown, no backticks, no extra text).
+                - The JSON MUST match the schema described in ctx.output_format.
+                - It must be a JSON object with keys: "reasoning" (string) and "actions" (array).
+                - Each action must be an object with "variant" plus the required fields.
+                - To finish, call the custom action exactly as:
+                {"variant":"answer","input":"<final answer string>"}.
+`;
+
             context = await chromium.launchPersistentContext("", {
                 channel: "chrome",
                 headless: false,
@@ -147,29 +166,37 @@ async function main() {
 
             agent = await startBrowserAgent({
                 browser: { context: context },
-                llm: {
-                    // provider: 'openai-generic',
-                    // options: {
-                    //     baseUrl: 'https://openrouter.ai/api/v1',
-                    //     // model: 'bytedance/ui-tars-1.5-7b',
-                    //     model: 'z-ai/glm-4.5v',
-                    //     // model: 'meta-llama/llama-4-maverick',
-                    //     apiKey: process.env.OPENROUTER_API_KEY,
-                    //     // temperature: 0.1
-                    // },
-                    // options: {
-                    //     baseUrl: 'https://openrouter.ai/api/v1',
-                    //     // model: 'qwen/qwen2.5-vl-72b-instruct',
-                    //     model: 'qwen/qwen3-vl-30b-a3b-instruct',
-                    //     apiKey: process.env.OPENROUTER_API_KEY
-                    // }
-                    provider: 'anthropic', // your provider of choice
-                    options: {
-                        // any required + optional configuration for that provider
-                        model: 'claude-sonnet-4-5-20250929',
-                        apiKey: process.env.ANTHROPIC_API_KEY
-                    }
-                },
+                llm: (() => {
+                                    // Heuristic:
+                                    // - If model looks like an OpenRouter id (contains "/"), use OpenRouter via openai-generic
+                                    // - Otherwise, treat it as an Anthropic model name
+                                    if (policyModel.includes("/")) {
+                                        if (!process.env.OPENROUTER_API_KEY) {
+                                            throw new Error("Missing OPENROUTER_API_KEY for OpenRouter models");
+                                        }
+                                        return {
+                                            provider: "openai-generic",
+                                            options: {
+                                                baseUrl: "https://openrouter.ai/api/v1",
+                                                model: policyModel,
+                                                apiKey: process.env.OPENROUTER_API_KEY,
+                                                //temperature: 0.0,
+                                            },
+                                        } as const;
+                                    }
+
+                                    if (!process.env.ANTHROPIC_API_KEY) {
+                                        throw new Error("Missing ANTHROPIC_API_KEY for Anthropic models");
+                                    }
+                                    return {
+                                        provider: 'anthropic', // your provider of choice
+                                        options: {
+                                            // any required + optional configuration for that provider
+                                            model: policyModel,
+                                            apiKey: process.env.ANTHROPIC_API_KEY
+                                        }
+                                    } as const;
+                                })(),
                 url: task.web,
                 actions: [
                     createAction({
@@ -183,8 +210,9 @@ async function main() {
                     }),
                 ],
                 narrate: true,
-                prompt: `Be careful to satisfy the task criteria precisely. If sequences of actions are failing, go one action at at time.\nConsider that today is ${formattedDate}.\n\nFor scrolling: positive deltaY values scroll DOWN (to see content below), negative deltaY values scroll UP (to see content above).`,
+                //prompt: `Be careful to satisfy the task criteria precisely. If sequences of actions are failing, go one action at at time.\nConsider that today is ${formattedDate}.\n\nFor scrolling: positive deltaY values scroll DOWN (to see content below), negative deltaY values scroll UP (to see content above).`,
                 // screenshotMemoryLimit: 3,
+                prompt: `${policyModel.includes("/") ? OPENROUTER_FORMAT_PREFIX : ""}${BASE_POLICY_PROMPT}`,
             });
 
             agent.events.on("tokensUsed", async (usage: ModelUsage) => {

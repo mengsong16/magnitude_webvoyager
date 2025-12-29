@@ -63,10 +63,27 @@ function resolveTasksPath(datasetFile?: string) {
 
 // results_dir = subfolder name under ./results
 // resultsPathOpt = backward-compatible override from -r/--results-path
-function resolveResultsPath(resultsDir?: string, resultsPathOpt?: string) {
-    if (resultsPathOpt) return resultsPathOpt;
-    const dir = resultsDir || DEFAULT_RESULTS_DIR;
-    return path.join("results", dir);
+
+// function resolveResultsPath(resultsDir?: string, resultsPathOpt?: string) {
+//     if (resultsPathOpt) return resultsPathOpt;
+//     const dir = resultsDir || DEFAULT_RESULTS_DIR;
+//     return path.join("results", dir);
+// }
+
+function sanitizePolicyModel(s: string) {
+  // 把 bytedance/ui-tars-1.5-7b 变成 bytedance_ui-tars-1.5-7b
+  // 避免出现路径分隔符、空格等
+  return s.replace(/[^a-zA-Z0-9._-]+/g, "_");
+}
+
+function resolveResultsPath(resultsDir?: string, resultsPathOpt?: string, policyModelOpt?: string) {
+  if (resultsPathOpt) return resultsPathOpt;
+  const dir = resultsDir || DEFAULT_RESULTS_DIR;
+  const root = policyModelOpt
+    ? `results_${sanitizePolicyModel(policyModelOpt)}`
+    : "results";
+
+  return path.join(root, dir);
 }
 
 // src: https://github.com/MinorJerry/WebVoyager/blob/main/evaluation/auto_eval.py
@@ -109,6 +126,7 @@ interface RunOptions {
     dataset_file?: string;
     results_dir?: string;
     reflection?: boolean;
+    policy_model?: string;
 }
 
 interface EvalOptions {
@@ -117,6 +135,7 @@ interface EvalOptions {
     resultsPath?: string;   // legacy override
     dataset_file?: string;
     results_dir?: string;
+    policy_model?: string;
 }
 
 // Helper functions
@@ -357,7 +376,7 @@ function isUnfinishedDefault(runExists: boolean, runData: RunData) {
 
 async function filterTasksByOptions(tasks: Task[], options: RunOptions): Promise<Task[]> {
     const filteredTasks: Task[] = [];
-    const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath);
+    const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath, options.policy_model);
 
     for (const task of tasks) {
         const status = await getTaskStatus(task.id, resultsPath);
@@ -561,6 +580,7 @@ async function runTaskWithReflectionRetries(
     task: Task,
     resultsPath: string,
     writeEvalFile: boolean,
+    policyModel: string,
     maxAttempts: number,
 ): Promise<{ success: boolean; attempts: number }> {
     let reflectionHint: string | undefined = undefined;
@@ -572,7 +592,7 @@ async function runTaskWithReflectionRetries(
         );
 
         // Run the task. (We pass runEval through; eval writing is controlled by evaluateOnce/writeEvalFile.)
-        await runTaskAsProcess(task, writeEvalFile, resultsPath, reflectionHint);
+        await runTaskAsProcess(task, writeEvalFile, resultsPath, policyModel, reflectionHint);
 
         // Judge success using the same evaluator prompt/schema.
         lastEval = await evaluateOnce(task.id, resultsPath, writeEvalFile);
@@ -687,13 +707,14 @@ async function evalTask(taskId: string, resultsPath: string = "results/default")
 }
 
 
-async function runTaskAsProcess(task: Task, runEval: boolean, resultsPath: string = "results/default", reflectionHint?: string): Promise<boolean> {
+async function runTaskAsProcess(task: Task, runEval: boolean, resultsPath: string = "results/default", policyModel: string = "claude-sonnet-4-5-20250929", reflectionHint?: string): Promise<boolean> {
     return new Promise((resolve) => {
         const args = [
             path.join(__dirname, 'wv-runner.ts'),
             JSON.stringify(task),
             String(runEval),
             resultsPath,
+            policyModel,
         ];
 
         if (reflectionHint && reflectionHint.trim().length > 0) {
@@ -744,6 +765,7 @@ async function runTasksParallel(
     workers: number,
     runEval: boolean = false,
     resultsPath: string = "results/default",
+    policyModel: string = "claude-sonnet-4-5-20250929",
     useReflection: boolean = false,
 ) {
     // Run tasks in parallel with worker processes
@@ -767,6 +789,7 @@ async function runTasksParallel(
                     task,
                     resultsPath,
                     runEval,
+                    policyModel,
                     MAX_REFLECTION_ATTEMPTS,
                 );
 
@@ -783,7 +806,7 @@ async function runTasksParallel(
                     );
                 }
             } else {
-                const processOk = await runTaskAsProcess(task, runEval, resultsPath);
+                const processOk = await runTaskAsProcess(task, runEval, resultsPath, policyModel);
 
                 finishedTasks++;
                 if (processOk) succeededTasks++;
@@ -876,10 +899,11 @@ program
     .option("-r, --results-path <path>", "Path to results directory")
     .option("--dataset_file <name>", "Dataset file under ./data", DEFAULT_DATASET_FILE)
     .option("--results_dir <name>", "Subfolder under ./results", DEFAULT_RESULTS_DIR)
+    .option("--policy_model <name>", "Policy LLM model (Anthropic name like 'claude-sonnet-4-5-20250929' or OpenRouter id like 'bytedance/ui-tars-1.5-7b')", "claude-sonnet-4-5-20250929")
     .action(async (input: string | undefined, options: RunOptions) => {
         // Resolve paths from new params (and keep -r as override)
         TASKS_PATH = resolveTasksPath(options.dataset_file);
-        const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath);
+        const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath, options.policy_model);
 
         const workers = parseInt(options.workers);
         let tasksToRun: Task[] = [];
@@ -936,7 +960,7 @@ program
 
         p.outro(`Running ${tasksToRun.length} task${tasksToRun.length !== 1 ? "s" : ""} with ${workers} worker${workers !== 1 ? "s" : ""}`);
 
-        await runTasksParallel(tasksToRun, workers, options.eval || false, resultsPath, options.reflection || false);
+        await runTasksParallel(tasksToRun, workers, options.eval || false, resultsPath, options.policy_model || "claude-sonnet-4-5-20250929", options.reflection || false);
     });
 
 program
@@ -947,10 +971,11 @@ program
     .option("-r, --results-path <path>", "Path to results directory")
     .option("--dataset_file <name>", "Dataset file under ./data", DEFAULT_DATASET_FILE)
     .option("--results_dir <name>", "Subfolder under ./results", DEFAULT_RESULTS_DIR)
-    .action(async (input: string | undefined, options: EvalOptions) => {
+        .option("--policy_model <name>", "Policy LLM model (Anthropic name like 'claude-sonnet-4-5-20250929' or OpenRouter id like 'bytedance/ui-tars-1.5-7b')", "claude-sonnet-4-5-20250929")
+.action(async (input: string | undefined, options: EvalOptions) => {
         // Resolve paths from new params (and keep -r as override)
         TASKS_PATH = resolveTasksPath(options.dataset_file);
-        const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath);
+        const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath, options.policy_model);
 
         const workers = parseInt(options.workers);
         let taskIdsToEval: string[] = [];
@@ -1015,9 +1040,10 @@ program
     .option("-r, --results-path <path>", "Path to results directory")
     .option("--dataset_file <name>", "Dataset file under ./data", DEFAULT_DATASET_FILE)
     .option("--results_dir <name>", "Subfolder under ./results", DEFAULT_RESULTS_DIR)
-    .action(async (options: any) => {
+        .option("--policy_model <name>", "Policy LLM model (Anthropic name like 'claude-sonnet-4-5-20250929' or OpenRouter id like 'bytedance/ui-tars-1.5-7b')", "claude-sonnet-4-5-20250929")
+.action(async (options: any) => {
         TASKS_PATH = resolveTasksPath(options.dataset_file);
-        const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath);
+        const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath, options.policy_model);
         await showStats(options.verbose || false, resultsPath);
     });
 
