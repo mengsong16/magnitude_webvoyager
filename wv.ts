@@ -127,6 +127,7 @@ interface RunOptions {
     results_dir?: string;
     reflection?: boolean;
     policy_model?: string;
+    model_platform?: string;
 }
 
 interface EvalOptions {
@@ -581,6 +582,7 @@ async function runTaskWithReflectionRetries(
     resultsPath: string,
     writeEvalFile: boolean,
     policyModel: string,
+    modelPlatform: string | undefined,
     maxAttempts: number,
 ): Promise<{ success: boolean; attempts: number }> {
     let reflectionHint: string | undefined = undefined;
@@ -592,7 +594,7 @@ async function runTaskWithReflectionRetries(
         );
 
         // Run the task. (We pass runEval through; eval writing is controlled by evaluateOnce/writeEvalFile.)
-        await runTaskAsProcess(task, writeEvalFile, resultsPath, policyModel, reflectionHint);
+        await runTaskAsProcess(task, writeEvalFile, resultsPath, policyModel, modelPlatform, reflectionHint);
 
         // Judge success using the same evaluator prompt/schema.
         lastEval = await evaluateOnce(task.id, resultsPath, writeEvalFile);
@@ -707,7 +709,7 @@ async function evalTask(taskId: string, resultsPath: string = "results/default")
 }
 
 
-async function runTaskAsProcess(task: Task, runEval: boolean, resultsPath: string = "results/default", policyModel: string = "claude-sonnet-4-5-20250929", reflectionHint?: string): Promise<boolean> {
+async function runTaskAsProcess(task: Task, runEval: boolean, resultsPath: string = "results/default", policyModel: string = "claude-sonnet-4-5-20250929", modelPlatform?: string, reflectionHint?: string): Promise<boolean> {
     return new Promise((resolve) => {
         const args = [
             path.join(__dirname, 'wv-runner.ts'),
@@ -716,6 +718,10 @@ async function runTaskAsProcess(task: Task, runEval: boolean, resultsPath: strin
             resultsPath,
             policyModel,
         ];
+
+        if (modelPlatform && modelPlatform.trim().length > 0) {
+            args.push(modelPlatform);
+        }
 
         if (reflectionHint && reflectionHint.trim().length > 0) {
             args.push(JSON.stringify(reflectionHint));
@@ -766,6 +772,7 @@ async function runTasksParallel(
     runEval: boolean = false,
     resultsPath: string = "results/default",
     policyModel: string = "claude-sonnet-4-5-20250929",
+    modelPlatform: string | undefined = undefined,
     useReflection: boolean = false,
 ) {
     // Run tasks in parallel with worker processes
@@ -790,6 +797,7 @@ async function runTasksParallel(
                     resultsPath,
                     runEval,
                     policyModel,
+                    modelPlatform,
                     MAX_REFLECTION_ATTEMPTS,
                 );
 
@@ -806,7 +814,7 @@ async function runTasksParallel(
                     );
                 }
             } else {
-                const processOk = await runTaskAsProcess(task, runEval, resultsPath, policyModel);
+                const processOk = await runTaskAsProcess(task, runEval, resultsPath, policyModel, modelPlatform);
 
                 finishedTasks++;
                 if (processOk) succeededTasks++;
@@ -900,6 +908,7 @@ program
     .option("--dataset_file <name>", "Dataset file under ./data", DEFAULT_DATASET_FILE)
     .option("--results_dir <name>", "Subfolder under ./results", DEFAULT_RESULTS_DIR)
     .option("--policy_model <name>", "Policy LLM model (Anthropic name like 'claude-sonnet-4-5-20250929' or OpenRouter id like 'bytedance/ui-tars-1.5-7b')", "claude-sonnet-4-5-20250929")
+    .option("--model_platform <platform>", "Policy model platform: anthropic | openrouter | zenmux (if omitted, infer from policy_model to keep old behavior)")
     .action(async (input: string | undefined, options: RunOptions) => {
         // Resolve paths from new params (and keep -r as override)
         TASKS_PATH = resolveTasksPath(options.dataset_file);
@@ -960,7 +969,7 @@ program
 
         p.outro(`Running ${tasksToRun.length} task${tasksToRun.length !== 1 ? "s" : ""} with ${workers} worker${workers !== 1 ? "s" : ""}`);
 
-        await runTasksParallel(tasksToRun, workers, options.eval || false, resultsPath, options.policy_model || "claude-sonnet-4-5-20250929", options.reflection || false);
+        await runTasksParallel(tasksToRun, workers, options.eval || false, resultsPath, options.policy_model || "claude-sonnet-4-5-20250929", options.model_platform, options.reflection || false);
     });
 
 program

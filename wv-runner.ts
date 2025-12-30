@@ -28,10 +28,24 @@ async function main() {
     //   argv[5] = policyModel (string)
     //   argv[6] = reflectionHint (string | JSON string)
     const policyModel = process.argv[5] || 'claude-sonnet-4-5-20250929';
-    const reflectionHintArg = process.argv[6];
+    const maybePlatformOrHint = process.argv[6];
+    const maybeHint = process.argv[7];
+    const SUPPORTED_PLATFORMS = ["anthropic", "openrouter", "zenmux"] as const;
+    type ModelPlatform = (typeof SUPPORTED_PLATFORMS)[number];
+    let modelPlatform: ModelPlatform | null = null;
+    let reflectionHintArg: string | undefined = undefined;
+    if (maybePlatformOrHint && (SUPPORTED_PLATFORMS as readonly string[]).includes(maybePlatformOrHint)) {
+        modelPlatform = maybePlatformOrHint as ModelPlatform;
+        reflectionHintArg = maybeHint;
+    } else {
+        reflectionHintArg = maybePlatformOrHint;
+    }
 
 
     console.log(`[Runner] Using policy model: ${policyModel}`);
+    if (modelPlatform) {
+        console.log(`[Runner] Using model platform: ${modelPlatform}`);
+    }
     let reflectionHint: string | null = null;
     if (reflectionHintArg) {
         try {
@@ -173,10 +187,23 @@ async function main() {
             agent = await startBrowserAgent({
                 browser: { context: context },
                 llm: (() => {
-                                    // Heuristic:
-                                    // - If model looks like an OpenRouter id (contains "/"), use OpenRouter via openai-generic
-                                    // - Otherwise, treat it as an Anthropic model name
-                                    if (policyModel.includes("/")) {
+                                    // Model platform selection (minimal change):
+                                    // - If --model_platform is provided, trust it.
+                                    // - Otherwise preserve old heuristic:
+                                    //     * volcengine/... => ZenMux (openai-generic, https://zenmux.ai/api/v1)
+                                    //     * contains "/" => OpenRouter (openai-generic, https://openrouter.ai/api/v1)
+                                    //     * otherwise => Anthropic
+                                    const allowed = new Set(["anthropic", "openrouter", "zenmux"] as const);
+
+                                    if (!modelPlatform || !allowed.has(modelPlatform as any)) {
+                                        throw new Error(
+                                            `Invalid --model_platform: ${modelPlatform ?? "(missing)"}; must be one of: anthropic | openrouter | zenmux`
+                                        );
+                                    }
+
+                                    const platform = modelPlatform as "anthropic" | "openrouter" | "zenmux";
+
+                                    if (platform === "openrouter") {
                                         if (!process.env.OPENROUTER_API_KEY) {
                                             throw new Error("Missing OPENROUTER_API_KEY for OpenRouter models");
                                         }
@@ -191,9 +218,30 @@ async function main() {
                                         } as const;
                                     }
 
+                                    if (platform === "zenmux") {
+                                        const zenKey =
+                                            process.env.ZENMUX_API_KEY ||
+                                            process.env.ZENMUX_API_TOKEN ||
+                                            process.env.ZENMUX_KEY;
+                                        if (!zenKey) {
+                                            throw new Error("Missing ZENMUX_API_KEY (or ZENMUX_API_TOKEN / ZENMUX_KEY) for ZenMux models");
+                                        }
+                                        return {
+                                            provider: "openai-generic",
+                                            options: {
+                                                baseUrl: "https://zenmux.ai/api/v1",
+                                                model: policyModel,
+                                                apiKey: zenKey,
+                                                //temperature: 0.0,
+                                            },
+                                        } as const;
+                                    }
+
+                                    // anthropic
                                     if (!process.env.ANTHROPIC_API_KEY) {
                                         throw new Error("Missing ANTHROPIC_API_KEY for Anthropic models");
                                     }
+
                                     return {
                                         provider: 'anthropic', // your provider of choice
                                         options: {
@@ -218,7 +266,9 @@ async function main() {
                 narrate: true,
                 //prompt: `Be careful to satisfy the task criteria precisely. If sequences of actions are failing, go one action at at time.\nConsider that today is ${formattedDate}.\n\nFor scrolling: positive deltaY values scroll DOWN (to see content below), negative deltaY values scroll UP (to see content above).`,
                 // screenshotMemoryLimit: 3,
-                prompt: `${policyModel.includes("/") ? OPENROUTER_FORMAT_PREFIX : ""}${BASE_POLICY_PROMPT}`,
+
+                // Add OpenRouter-specific format prefix only when the policy model name contains "ui-tars" (case-insensitive; also matches ui_tars / UITARS); otherwise use BASE_POLICY_PROMPT only.
+                prompt: `${/ui[-_]?tars/i.test(policyModel) ? OPENROUTER_FORMAT_PREFIX : ""}${BASE_POLICY_PROMPT}`,
             });
 
             agent.events.on("tokensUsed", async (usage: ModelUsage) => {
