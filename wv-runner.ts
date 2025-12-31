@@ -30,7 +30,7 @@ async function main() {
     const policyModel = process.argv[5] || 'claude-sonnet-4-5-20250929';
     const maybePlatformOrHint = process.argv[6];
     const maybeHint = process.argv[7];
-    const SUPPORTED_PLATFORMS = ["anthropic", "openrouter", "zenmux"] as const;
+    const SUPPORTED_PLATFORMS = ["anthropic", "openrouter", "zenmux", "openai"] as const;
     type ModelPlatform = (typeof SUPPORTED_PLATFORMS)[number];
     let modelPlatform: ModelPlatform | null = null;
     let reflectionHintArg: string | undefined = undefined;
@@ -193,15 +193,15 @@ async function main() {
                                     //     * volcengine/... => ZenMux (openai-generic, https://zenmux.ai/api/v1)
                                     //     * contains "/" => OpenRouter (openai-generic, https://openrouter.ai/api/v1)
                                     //     * otherwise => Anthropic
-                                    const allowed = new Set(["anthropic", "openrouter", "zenmux"] as const);
+                                    const allowed = new Set(["anthropic", "openrouter", "zenmux", "openai"] as const);
 
                                     if (!modelPlatform || !allowed.has(modelPlatform as any)) {
                                         throw new Error(
-                                            `Invalid --model_platform: ${modelPlatform ?? "(missing)"}; must be one of: anthropic | openrouter | zenmux`
+                                            `Invalid --model_platform: ${modelPlatform ?? "(missing)"}; must be one of: anthropic | openrouter | zenmux | openai`
                                         );
                                     }
 
-                                    const platform = modelPlatform as "anthropic" | "openrouter" | "zenmux";
+                                    const platform = modelPlatform as "anthropic" | "openrouter" | "zenmux" | "openai";
 
                                     if (platform === "openrouter") {
                                         if (!process.env.OPENROUTER_API_KEY) {
@@ -213,7 +213,20 @@ async function main() {
                                                 baseUrl: "https://openrouter.ai/api/v1",
                                                 model: policyModel,
                                                 apiKey: process.env.OPENROUTER_API_KEY,
-                                                //temperature: 0.0,
+                                            },
+                                        } as const;
+                                    }
+
+                                    if (platform === "openai") {
+                                        if (!process.env.OPENAI_API_KEY) {
+                                            throw new Error("Missing OPENAI_API_KEY for OpenAI models");
+                                        }
+                                        return {
+                                            provider: "openai",
+                                            options: {
+                                                model: policyModel,
+                                                apiKey: process.env.OPENAI_API_KEY,
+                                                temperature: 1, // gpt-5 只支持默认温度, 如果不传，magnitude内部会设置temperature=0.2
                                             },
                                         } as const;
                                     }
@@ -232,7 +245,6 @@ async function main() {
                                                 baseUrl: "https://zenmux.ai/api/v1",
                                                 model: policyModel,
                                                 apiKey: zenKey,
-                                                //temperature: 0.0,
                                             },
                                         } as const;
                                     }

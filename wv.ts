@@ -908,8 +908,13 @@ program
     .option("--dataset_file <name>", "Dataset file under ./data", DEFAULT_DATASET_FILE)
     .option("--results_dir <name>", "Subfolder under ./results", DEFAULT_RESULTS_DIR)
     .option("--policy_model <name>", "Policy LLM model (Anthropic name like 'claude-sonnet-4-5-20250929' or OpenRouter id like 'bytedance/ui-tars-1.5-7b')", "claude-sonnet-4-5-20250929")
-    .option("--model_platform <platform>", "Policy model platform: anthropic | openrouter | zenmux (if omitted, infer from policy_model to keep old behavior)")
+    .option("--model_platform <platform>", "Policy model platform: anthropic | openrouter | zenmux | openai (required for run)")
     .action(async (input: string | undefined, options: RunOptions) => {
+        const allowedPlatforms = new Set(["anthropic", "openrouter", "zenmux", "openai"]);
+        if (!options.model_platform || !allowedPlatforms.has(options.model_platform)) {
+            throw new Error(`Invalid --model_platform: ${options.model_platform ?? "(missing)"}; must be one of: anthropic | openrouter | zenmux | openai`);
+        }
+
         // Resolve paths from new params (and keep -r as override)
         TASKS_PATH = resolveTasksPath(options.dataset_file);
         const resultsPath = resolveResultsPath(options.results_dir, options.resultsPath, options.policy_model);
