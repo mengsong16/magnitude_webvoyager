@@ -106,6 +106,61 @@ As an evaluator, you will be presented with three primary components to assist y
 You should elaborate on how you arrived at your final evaluation and then provide a definitive verdict on whether the task has been successfully accomplished, either as 'SUCCESS' or 'NOT SUCCESS'.
 `;
 
+
+
+const EVALUATION_PROMPT_STRICT_SUFFIX = `
+IMPORTANT STRICT OUTPUT RULES:
+- Output ONLY a single JSON object. No markdown, no code fences, no extra text.
+- Do NOT output action traces (e.g., mouse:click / mouse:scroll / keyboard:*), tool logs, or any other commentary.
+- Your JSON must exactly match the schema described above.
+`;
+
+function shouldRetryEvalParse(errMsg: string): boolean {
+    return /BamlValidationError|Failed to parse|Failed to coerce|Missing required field/i.test(errMsg);
+}
+
+async function queryEvalWithRetry(agent: any, taskQues: string) {
+    const schema = z.object({
+        reasoning: z.string(),
+        result: z.enum(["SUCCESS", "NOT SUCCESS"]),
+    });
+
+    const basePrompt = EVALUATION_PROMPT + "\n\n" + `TASK: ${taskQues}`;
+
+    try {
+        const evalResult = await agent.query(basePrompt, schema);
+        return { evalResult, evalMeta: null as any };
+    } catch (e: any) {
+        const firstErrMsg = e instanceof Error ? e.message : String(e);
+        if (!shouldRetryEvalParse(firstErrMsg)) throw e;
+
+        const evalMeta: any = {
+            first_eval_failed: true,
+            first_eval_error: firstErrMsg,
+            used_strict_prompt_retry: true,
+            retry_failed: false,   // ✅ retry 成功时会带着 false 写入 _meta
+        };
+
+        try {
+            const strictPrompt =
+                EVALUATION_PROMPT + EVALUATION_PROMPT_STRICT_SUFFIX + "\n\n" + `TASK: ${taskQues}`;
+            const evalResult = await agent.query(strictPrompt, schema);
+            return { evalResult, evalMeta };
+        } catch (e2: any) {
+            const secondErrMsg = e2 instanceof Error ? e2.message : String(e2);
+            evalMeta.retry_failed = true;
+            evalMeta.retry_error = secondErrMsg;
+
+            // Fall back to a deterministic NOT SUCCESS so the overall run can continue.
+            const evalResult = {
+                reasoning:
+                    `Judge output failed schema parsing twice. First error: ${firstErrMsg}\nSecond error: ${secondErrMsg}`,
+                result: "NOT SUCCESS" as const,
+            };
+            return { evalResult, evalMeta };
+        }
+    }
+}
 interface Task {
     web_name: string;
     id: string;
@@ -509,18 +564,12 @@ async function evaluateOnce(
     const agent = await createJudgeAgent();
     await agent.memory.loadJSON(memJson);
 
-    const evalResult = await agent.query(
-        EVALUATION_PROMPT + "\n\n" + `TASK: ${task.ques}`,
-        z.object({
-            reasoning: z.string(),
-            result: z.enum(["SUCCESS", "NOT SUCCESS"]),
-        }),
-    );
-
-    if (writeEvalFile) {
+    const { evalResult, evalMeta } = await queryEvalWithRetry(agent, task.ques);
+if (writeEvalFile) {
         const evalPath = path.join(resultsPath, `${task.id}.eval.json`);
-        fs.writeFileSync(evalPath, JSON.stringify(evalResult, null, 4));
-    }
+        const evalOut: any = evalMeta ? { ...evalResult, _meta: evalMeta } : evalResult;
+    fs.writeFileSync(evalPath, JSON.stringify(evalOut, null, 4));
+}
 
     return evalResult as EvalResult;
 }
@@ -694,18 +743,13 @@ async function evalTask(taskId: string, resultsPath: string = "results/default")
     // load the saved memory into the judge's memory
     await agent.memory.loadJSON(memJson);
 
-    const evalResult = await agent.query(
-        EVALUATION_PROMPT + "\n\n" + `TASK: ${task.ques}`,
-        z.object({
-            reasoning: z.string(),
-            result: z.enum(["SUCCESS", "NOT SUCCESS"]),
-        }),
-    );
+    const { evalResult, evalMeta } = await queryEvalWithRetry(agent, task.ques);
+    const evalOut: any = evalMeta ? { ...evalResult, _meta: evalMeta } : evalResult;
 
-    console.log(evalResult);
+    console.log(evalOut);
 
     const evalPath = path.join(resultsPath, `${task.id}.eval.json`);
-    fs.writeFileSync(evalPath, JSON.stringify(evalResult, null, 4));
+    fs.writeFileSync(evalPath, JSON.stringify(evalOut, null, 4));
 }
 
 

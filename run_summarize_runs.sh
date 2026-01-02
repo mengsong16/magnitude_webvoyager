@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASE_RESULTS_DIR="results"
+BASE_RESULTS_DIR="results_gpt-5"
 
 RUN_DIRS=(
-  "webvoyager_mini_30_4_worker_reflection_run4"
-  "webvoyager_mini_30_4_worker_reflection_run5"
-  "webvoyager_mini_30_4_worker_reflection_run6"
+  "webvoyager_mini_30_4_worker_reflection_run1"
+  "webvoyager_mini_30_4_worker_reflection_run2"
+  "webvoyager_mini_30_4_worker_reflection_run3"
 )
 
 # ----- compute common part (longest common prefix) of RUN_DIRS -----
